@@ -555,7 +555,21 @@ def top_n_chart(
     title: str,
     top_n: int = 10,
 ):
-    chart_df = summary.nlargest(top_n, value).copy()
+    # 집계 후 남아 있는 기존 인덱스나 Plotly의 범주 정렬에 순위가 좌우되지 않도록
+    # 표시 기준으로 명시 정렬한 뒤 인덱스를 새로 부여합니다.
+    tie_breakers = [
+        col for col in ["SKU", category] if col in summary.columns and col != value
+    ]
+    chart_df = (
+        summary.sort_values(
+            [value, *tie_breakers],
+            ascending=[False, *([True] * len(tie_breakers))],
+            kind="stable",
+        )
+        .head(top_n)
+        .reset_index(drop=True)
+        .copy()
+    )
     chart_df["_순위"] = range(1, len(chart_df) + 1)
     chart_df["_표시명"] = (
         chart_df["_순위"].astype(str)
@@ -571,7 +585,6 @@ def top_n_chart(
             )
     else:
         chart_df["_텍스트"] = chart_df[value].map(lambda x: f"{x:,.0f}")
-    chart_df = chart_df.sort_values(value)
     fig = px.bar(
         chart_df,
         x=value,
@@ -580,6 +593,7 @@ def top_n_chart(
         text="_텍스트",
         title=title,
         hover_data=[col for col in ["출고수량", "출고금액"] if col in chart_df.columns],
+        category_orders={"_표시명": chart_df["_표시명"].tolist()},
         color_discrete_sequence=["#2563EB"],
     )
     fig.update_traces(
@@ -595,6 +609,7 @@ def top_n_chart(
         xaxis_tickformat=",.0f",
         showlegend=False,
     )
+    fig.update_yaxes(autorange="reversed")
     return fig
 
 
