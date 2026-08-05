@@ -609,7 +609,6 @@ def top_n_chart(
         xaxis_tickformat=",.0f",
         showlegend=False,
     )
-    fig.update_yaxes(autorange="reversed")
     return fig
 
 
