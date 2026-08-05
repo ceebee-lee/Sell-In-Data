@@ -235,7 +235,10 @@ def apply_continent_mapping(
 ) -> pd.DataFrame:
     """거래처 → 거래처코드 → 거래처명 순으로 대륙을 연결합니다."""
     result = sellin_df.copy()
-    result["대륙"] = "미지정"
+    if "대륙" in result.columns:
+        result["대륙"] = result["대륙"].map(normalize_continent)
+    else:
+        result["대륙"] = "미지정"
 
     mapping = mapping_df.copy()
     for col in ["거래처", "거래처코드", "거래처명", "대륙"]:
@@ -249,7 +252,8 @@ def apply_continent_mapping(
         .drop_duplicates("거래처", keep="last")
         .set_index("거래처")["대륙"]
     )
-    result["대륙"] = result["거래처"].map(customer_map).fillna("미지정")
+    customer_match = result["거래처"].map(customer_map)
+    result["대륙"] = result["대륙"].mask(customer_match.notna(), customer_match)
 
     code_map = (
         mapping[mapping["거래처코드"].ne("")]
@@ -257,10 +261,8 @@ def apply_continent_mapping(
         .set_index("거래처코드")["대륙"]
     )
     code_match = result["거래처코드"].map(code_map)
-    result["대륙"] = result["대륙"].mask(
-        result["대륙"].eq("미지정") & code_match.notna(),
-        code_match,
-    )
+    unmatched_customer = customer_match.isna()
+    result["대륙"] = result["대륙"].mask(unmatched_customer & code_match.notna(), code_match)
 
     name_map = (
         mapping[mapping["거래처명"].ne("")]
@@ -268,21 +270,11 @@ def apply_continent_mapping(
         .set_index("거래처명")["대륙"]
     )
     name_match = result["거래처명"].map(name_map)
-    result["대륙"] = result["대륙"].mask(
-        result["대륙"].eq("미지정") & name_match.notna(),
-        name_match,
-    )
+    unmatched_code = unmatched_customer & code_match.isna()
+    result["대륙"] = result["대륙"].mask(unmatched_code & name_match.notna(), name_match)
 
     result["대륙"] = result["대륙"].fillna("미지정").replace("", "미지정")
 
-    # 거래처명에 국가가 명시된 경우에는 미지정 거래처만 자동 보완합니다.
-    # 사용자가 매핑 파일에서 다른 대륙으로 지정한 값은 그대로 우선합니다.
-    explicit_russia = (
-        result["거래처"].astype("string").fillna("")
-        + " "
-        + result["거래처명"].astype("string").fillna("")
-    ).str.contains(r"러시아|\brussia\b|russian", case=False, na=False, regex=True)
-    result.loc[result["대륙"].eq("미지정") & explicit_russia, "대륙"] = "러시아"
     return result
 
 
@@ -652,6 +644,7 @@ def style_table(df: pd.DataFrame, percent_cols: list[str] | None = None):
         if col in {
             "출고수량",
             "출고금액",
+            "출고금액(원)",
             "건당평균금액",
             "평균출고단가",
             "누적출고금액",
@@ -817,9 +810,13 @@ if continent_mapping_file is not None:
     except Exception as exc:
         st.sidebar.error(f"대륙 매핑 파일 오류: {exc}")
 
-with st.expander("거래처별 대륙 입력·수정", expanded=False):
+with st.expander(
+    "거래처별 대륙 입력·수정",
+    expanded=bool(customer_master["대륙"].eq("미지정").any()),
+):
     st.caption(
-        "대륙을 입력한 뒤 CSV로 저장하면 다음 실행에서도 그대로 불러올 수 있습니다."
+        "거래처별 대륙을 직접 선택한 뒤 '대륙 매핑 적용'을 누르세요. "
+        "여러 행을 수정해도 적용 버튼을 누를 때 한 번만 다시 계산됩니다."
     )
     if mapping_message:
         st.success(mapping_message)
@@ -834,25 +831,29 @@ with st.expander("거래처별 대륙 입력·수정", expanded=False):
         f"continent_editor_{source_file_hash}_{sheet_name}_"
         f"{mapping_file_hash}_{customer_identity_hash}"
     )
-    edited_continent_mapping = st.data_editor(
-        customer_master[["거래처", "거래처코드", "거래처명", "대륙"]],
-        column_config={
-            "거래처": st.column_config.TextColumn("거래처", disabled=True),
-            "거래처코드": st.column_config.TextColumn("거래처코드", disabled=True),
-            "거래처명": st.column_config.TextColumn("거래처명", disabled=True),
-            "대륙": st.column_config.SelectboxColumn(
-                "대륙",
-                options=CONTINENT_OPTIONS,
-                required=True,
-            ),
-        },
-        disabled=["거래처", "거래처코드", "거래처명"],
-        hide_index=True,
-        width="stretch",
-        key=editor_key,
-    )
+    with st.form(key=f"continent_form_{editor_key}", clear_on_submit=False):
+        edited_continent_mapping = st.data_editor(
+            customer_master[["거래처", "거래처코드", "거래처명", "대륙"]],
+            column_config={
+                "거래처": st.column_config.TextColumn("거래처", disabled=True),
+                "거래처코드": st.column_config.TextColumn("거래처코드", disabled=True),
+                "거래처명": st.column_config.TextColumn("거래처명", disabled=True),
+                "대륙": st.column_config.SelectboxColumn(
+                    "대륙",
+                    options=CONTINENT_OPTIONS,
+                    required=True,
+                ),
+            },
+            disabled=["거래처", "거래처코드", "거래처명"],
+            hide_index=True,
+            width="stretch",
+            key=editor_key,
+        )
+        st.form_submit_button("대륙 매핑 적용", type="primary")
 
-    mapping_csv = edited_continent_mapping.to_csv(
+    mapping_csv = edited_continent_mapping[
+        ["거래처", "거래처코드", "거래처명", "대륙"]
+    ].to_csv(
         index=False,
         encoding="utf-8-sig",
     )
@@ -1037,11 +1038,9 @@ base_amount = global_df["분석금액"].sum()
 qty_filter_share = filtered_qty / base_qty if base_qty != 0 else np.nan
 amount_filter_share = filtered_amount / base_amount if base_amount != 0 else np.nan
 
-st.info(
-    f"**분석 기간:** {start_date} ~ {end_date}  \n"
-    "거래처 포함/제외 및 상세 필터 조건이 적용된 결과입니다.  \n"
-    f"현재 결과는 거래처 기준 데이터 대비 출고수량 {format_pct(qty_filter_share)}, "
-    f"출고금액 {format_pct(amount_filter_share)}입니다."
+st.caption(
+    f"분석 기간 {start_date} ~ {end_date} · 거래처 기준 데이터 대비 "
+    f"출고수량 {format_pct(qty_filter_share)} · 출고금액 {format_pct(amount_filter_share)}"
 )
 
 customer_summary = make_customer_summary(filtered)
@@ -1070,8 +1069,29 @@ with tab_summary:
     total_amount = filtered["분석금액"].sum()
 
     k1, k2 = st.columns(2)
-    k1.metric("총 출고수량", format_number(total_qty))
-    k2.metric("총 출고금액", format_number(total_amount))
+    k1.metric(
+        "순출고수량 (개)",
+        format_number(total_qty),
+        help="정상 출고와 반품(음수 출고)을 합산한 수량입니다.",
+    )
+    k2.metric("출고금액 (원)", format_number(total_amount))
+
+    st.subheader("전체 Top 20 SKU · 출고수량 기준")
+    summary_sku_display = sku_summary.head(20).copy()
+    summary_sku_display.insert(0, "순위", range(1, len(summary_sku_display) + 1))
+    summary_sku_display = summary_sku_display.rename(
+        columns={"제품명_정리": "제품명", "출고금액": "출고금액(원)"}
+    )
+    st.dataframe(
+        style_table(
+            summary_sku_display[
+                ["순위", "SKU", "제품명", "출고수량", "출고금액(원)"]
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+        height=735,
+    )
 
     trend_granularity = st.radio(
         "출고수량 추이 단위",
@@ -1113,26 +1133,10 @@ with tab_summary:
         width="stretch",
     )
 
-    st.subheader("전체 Top 20 SKU · 출고수량 기준")
-    summary_sku_display = sku_summary.head(20).copy()
-    summary_sku_display.insert(0, "순위", range(1, len(summary_sku_display) + 1))
-    summary_sku_display = summary_sku_display.rename(
-        columns={"제품명_정리": "제품명"}
-    )
-    st.dataframe(
-        style_table(
-            summary_sku_display[
-                ["순위", "SKU", "제품명", "출고수량", "출고금액"]
-            ]
-        ),
-        width="stretch",
-        hide_index=True,
-        height=760,
-    )
-
     st.subheader("월별 요약")
+    monthly_display = monthly_summary.rename(columns={"출고금액": "출고금액(원)"})
     st.dataframe(
-        style_table(monthly_summary[["연월", "출고수량", "출고금액"]]),
+        style_table(monthly_display[["연월", "출고수량", "출고금액(원)"]]),
         width="stretch",
         hide_index=True,
     )
@@ -1141,8 +1145,31 @@ with tab_summary:
 # 대륙 분석
 # ---------------------------------------------------------------------
 with tab_continent:
+    assigned_rows = filtered[~filtered["대륙"].eq("미지정")]
+    assigned_customer_count = assigned_rows["거래처"].nunique()
+    total_customer_count = filtered["거래처"].nunique()
+    assigned_row_share = len(assigned_rows) / len(filtered) if len(filtered) else 0
+    st.caption(
+        f"대륙 지정 거래처 {assigned_customer_count:,}/{total_customer_count:,}개 · "
+        f"분석 행 커버리지 {assigned_row_share:.1%}"
+    )
+    include_unassigned_continent = st.checkbox(
+        "대륙 분석에 '미지정' 포함",
+        value=False,
+        help="체크하지 않으면 대륙이 확인된 거래처만 차트와 요약에 포함됩니다.",
+    )
+    continent_source = (
+        filtered.copy() if include_unassigned_continent else assigned_rows.copy()
+    )
+    if continent_source.empty:
+        st.warning(
+            "대륙이 지정된 거래처가 없어 '미지정' 데이터를 표시합니다. "
+            "상단의 거래처별 대륙 입력·수정에서 매핑을 완료하세요."
+        )
+        continent_source = filtered.copy()
+
     continent_summary = (
-        filtered.groupby("대륙", as_index=False)
+        continent_source.groupby("대륙", as_index=False)
         .agg(
             출고수량=("분석수량", "sum"),
             출고금액=("분석금액", "sum"),
@@ -1160,7 +1187,7 @@ with tab_continent:
         0,
     )
     continent_monthly = (
-        filtered.dropna(subset=["출고일"])
+        continent_source.dropna(subset=["출고일"])
         .groupby(["연월", "대륙"], as_index=False)
         .agg(출고수량=("분석수량", "sum"))
         .sort_values(["연월", "대륙"])
@@ -1225,10 +1252,13 @@ with tab_continent:
         st.plotly_chart(continent_line, width="stretch")
 
     st.subheader("대륙별 요약")
+    continent_display = continent_summary.rename(
+        columns={"출고금액": "출고금액(원)"}
+    )
     st.dataframe(
         style_table(
-            continent_summary[
-                ["대륙", "출고수량", "출고금액", "비중", "전월대비수량"]
+            continent_display[
+                ["대륙", "출고수량", "출고금액(원)", "비중", "전월대비수량"]
             ],
             percent_cols=["비중", "전월대비수량"],
         ),
@@ -1241,8 +1271,8 @@ with tab_continent:
         options=continent_summary["대륙"].tolist(),
         key="continent_detail_select",
     )
-    continent_detail_df = filtered[
-        filtered["대륙"].eq(selected_continent_detail)
+    continent_detail_df = continent_source[
+        continent_source["대륙"].eq(selected_continent_detail)
     ].copy()
 
     detail_customer = make_customer_summary(continent_detail_df)
@@ -1299,29 +1329,62 @@ with tab_customer:
 
     customer_display = customer_summary.head(top_customer_count).copy()
     customer_display.insert(0, "순위", range(1, len(customer_display) + 1))
+    customer_main_display = customer_display.rename(
+        columns={"출고금액": "출고금액(원)"}
+    )
     st.dataframe(
         style_table(
-            customer_display[
+            customer_main_display[
                 [
                     "순위",
                     "거래처명",
-                    "거래처코드",
                     "출고수량",
-                    "출고금액",
+                    "출고금액(원)",
                     "금액비중",
-                    "수량비중",
-                    "SKU수",
-                    "출고건수",
-                    "건당평균금액",
-                    "최근출고일",
                 ]
             ],
-            percent_cols=["금액비중", "수량비중"],
+            percent_cols=["금액비중"],
         ),
         width="stretch",
         hide_index=True,
-        height=560,
+        height=min(735, 45 + top_customer_count * 32),
     )
+
+    st.plotly_chart(
+        top_n_chart(
+            customer_summary,
+            "거래처명",
+            "출고금액",
+            f"Top {top_customer_count} 거래처 · 출고금액 및 전체 비중",
+            top_n=top_customer_count,
+        ),
+        width="stretch",
+    )
+
+    with st.expander("거래처 순위 상세 지표", expanded=False):
+        st.dataframe(
+            style_table(
+                customer_display[
+                    [
+                        "순위",
+                        "거래처명",
+                        "거래처코드",
+                        "출고수량",
+                        "출고금액",
+                        "금액비중",
+                        "수량비중",
+                        "SKU수",
+                        "출고건수",
+                        "건당평균금액",
+                        "최근출고일",
+                    ]
+                ],
+                percent_cols=["금액비중", "수량비중"],
+            ),
+            width="stretch",
+            hide_index=True,
+            height=560,
+        )
 
     st.subheader("거래처 상세")
     selected_customer = st.selectbox(
@@ -1337,7 +1400,7 @@ with tab_customer:
 
     a, b, c, d = st.columns(4)
     a.metric("출고수량", format_number(selected_customer_summary["출고수량"]))
-    b.metric("출고금액", format_number(selected_customer_summary["출고금액"]))
+    b.metric("출고금액 (원)", format_number(selected_customer_summary["출고금액"]))
     c.metric("거래 SKU", format_number(selected_customer_summary["SKU수"]))
     d.metric("전체 금액 비중", format_pct(selected_customer_summary["금액비중"]))
 
@@ -1424,7 +1487,9 @@ with tab_sku:
 
     sku_display = sku_summary.copy()
     sku_display.insert(0, "순위", range(1, len(sku_display) + 1))
-    sku_display = sku_display.rename(columns={"제품명_정리": "제품명"})
+    sku_display = sku_display.rename(
+        columns={"제품명_정리": "제품명", "출고금액": "출고금액(원)"}
+    )
 
     st.dataframe(
         style_table(
@@ -1434,7 +1499,7 @@ with tab_sku:
                     "SKU",
                     "제품명",
                     "출고수량",
-                    "출고금액",
+                    "출고금액(원)",
                 ]
             ]
         ),
