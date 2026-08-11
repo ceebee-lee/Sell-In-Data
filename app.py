@@ -41,8 +41,8 @@ DATE_COLUMNS = [
 ]
 
 LABEL_MAP = {
-    "분석수량": "출고수량",
-    "분석금액": "출고금액",
+    "분석수량": "출고수량 (개)",
+    "분석금액": "출고금액 (천원)",
 }
 
 CONTINENT_OPTIONS = [
@@ -463,9 +463,13 @@ def apply_multiselect_filter(
 
 
 def make_customer_summary(df: pd.DataFrame) -> pd.DataFrame:
+    source = df.copy()
+    if "대륙" not in source.columns:
+        source["대륙"] = "미지정"
     result = (
-        df.groupby(["거래처", "거래처명", "거래처코드"], dropna=False)
+        source.groupby(["거래처", "거래처명", "거래처코드"], dropna=False)
         .agg(
+            대륙=("대륙", representative_text),
             출고수량=("분석수량", "sum"),
             출고금액=("분석금액", "sum"),
             SKU수=("SKU", "nunique"),
@@ -473,6 +477,11 @@ def make_customer_summary(df: pd.DataFrame) -> pd.DataFrame:
             최근출고일=("출고일", "max"),
         )
         .reset_index()
+    )
+    result["거래처표시"] = (
+        result["대륙"].astype("string").fillna("미지정")
+        + " | "
+        + result["거래처명"].astype("string").fillna("미기재")
     )
     total_amount = result["출고금액"].sum()
     total_qty = result["출고수량"].sum()
@@ -512,6 +521,39 @@ def make_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
         np.nan,
     )
     return result.sort_values(["출고수량", "출고금액"], ascending=False)
+
+
+def make_customer_sku_rank(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    """거래처별 출고수량 상위 SKU를 동률과 관계없이 정확히 N개까지 반환."""
+    source = df.copy()
+    if "대륙" not in source.columns:
+        source["대륙"] = "미지정"
+    result = (
+        source.groupby(
+            ["거래처", "거래처명", "거래처코드", "대륙", "SKU"],
+            as_index=False,
+        )
+        .agg(
+            출고수량=("분석수량", "sum"),
+            출고금액=("분석금액", "sum"),
+            제품명_정리=("제품명_정리", representative_text),
+        )
+        .sort_values(
+            ["거래처", "출고수량", "SKU"],
+            ascending=[True, False, True],
+            kind="stable",
+        )
+    )
+    result["거래처내순위"] = result.groupby("거래처").cumcount() + 1
+    result["거래처표시"] = (
+        result["대륙"].astype("string").fillna("미지정")
+        + " | "
+        + result["거래처명"].astype("string").fillna("미기재")
+    )
+    return result[result["거래처내순위"] <= top_n].sort_values(
+        ["거래처표시", "거래처내순위", "출고수량", "SKU"],
+        ascending=[True, True, False, True],
+    )
 
 
 def make_monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -577,38 +619,72 @@ def top_n_chart(
         + chart_df[category].astype("string").fillna("미기재")
     )
     total_value = summary[value].sum()
+    chart_df["_비중"] = np.where(
+        total_value != 0,
+        chart_df[value] / total_value,
+        0,
+    )
     if value == "출고금액":
-        chart_df["_텍스트"] = chart_df[value].map(lambda x: f"{x:,.0f}원")
-        if total_value != 0:
-            chart_df["_텍스트"] = chart_df["_텍스트"] + chart_df[value].map(
-                lambda x: f" · {x / total_value:.1%}"
-            )
+        chart_df["_차트값"] = chart_df[value] / 1_000
+        xaxis_title = "출고금액 (천원)"
+        hovertemplate = (
+            "%{y}<br>출고금액: %{customdata[0]:,.0f}원"
+            "<br>비중: %{customdata[1]:.1%}<extra></extra>"
+        )
     else:
-        chart_df["_텍스트"] = chart_df[value].map(lambda x: f"{x:,.0f}")
+        chart_df["_차트값"] = chart_df[value]
+        xaxis_title = "출고수량 (개)"
+        hovertemplate = (
+            "%{y}<br>출고수량: %{customdata[0]:,.0f}개"
+            "<br>비중: %{customdata[1]:.1%}<extra></extra>"
+        )
+    chart_df["_내부텍스트"] = chart_df["_차트값"].map(lambda x: f"{x:,.0f}")
+    chart_df["_외부텍스트"] = chart_df["_비중"].map(lambda x: f"{x:.1%}")
     fig = px.bar(
         chart_df,
-        x=value,
+        x="_차트값",
         y="_표시명",
         orientation="h",
-        text="_텍스트",
+        text="_내부텍스트",
         title=title,
-        hover_data=[col for col in ["출고수량", "출고금액"] if col in chart_df.columns],
-        category_orders={"_표시명": chart_df["_표시명"].tolist()},
+        custom_data=[value, "_비중"],
+        category_orders={"_표시명": chart_df["_표시명"].tolist()[::-1]},
         color_discrete_sequence=["#2563EB"],
     )
     fig.update_traces(
         texttemplate="%{text}",
-        textposition="outside",
+        textposition="inside",
+        insidetextanchor="middle",
+        textfont_color="white",
         cliponaxis=False,
+        hovertemplate=hovertemplate,
+        selector=dict(type="bar"),
     )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df["_차트값"],
+            y=chart_df["_표시명"],
+            text=chart_df["_외부텍스트"],
+            mode="text",
+            textposition="middle right",
+            cliponaxis=False,
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    max_value = chart_df["_차트값"].max() if not chart_df.empty else 0
     fig.update_layout(
-        height=max(420, top_n * 32),
-        margin=dict(l=20, r=55, t=55, b=20),
+        height=max(500, len(chart_df) * 34 + 120),
+        margin=dict(l=20, r=80, t=55, b=20),
         yaxis_title="",
-        xaxis_title=LABEL_MAP.get(value, value),
+        xaxis_title=xaxis_title,
         xaxis_tickformat=",.0f",
         showlegend=False,
+        uniformtext_minsize=10,
+        uniformtext_mode="show",
     )
+    if max_value > 0:
+        fig.update_xaxes(range=[0, max_value * 1.16])
     return fig
 
 
@@ -657,9 +733,12 @@ def style_table(df: pd.DataFrame, percent_cols: list[str] | None = None):
         for col in df.columns
         if col in {
             "출고수량",
+            "출고수량 (개)",
             "출고금액",
             "출고금액(원)",
+            "출고금액 (천원)",
             "건당평균금액",
+            "건당평균금액 (천원)",
             "평균출고단가",
             "누적출고금액",
             "누적출고수량",
@@ -898,6 +977,19 @@ st.sidebar.divider()
 st.sidebar.subheader("전체 분석 거래처 기준")
 
 all_customers = sort_unique(df["거래처"])
+sidebar_customer_labels = (
+    df[["거래처", "대륙", "거래처명"]]
+    .drop_duplicates("거래처")
+    .assign(
+        거래처표시=lambda data: (
+            data["대륙"].astype("string").fillna("미지정")
+            + " | "
+            + data["거래처명"].astype("string").fillna("미기재")
+        )
+    )
+    .set_index("거래처")["거래처표시"]
+    .to_dict()
+)
 customer_mode = st.sidebar.radio(
     "거래처 적용 방식",
     ["제외할 거래처 선택", "포함할 거래처 선택"],
@@ -910,6 +1002,7 @@ if customer_mode == "제외할 거래처 선택":
         "전체 SELL-IN에서 제외",
         options=all_customers,
         default=[],
+        format_func=lambda key: sidebar_customer_labels.get(key, key),
         placeholder="제외할 거래처 검색",
     )
     global_df = df[~df["거래처"].isin(selected_customers)].copy()
@@ -922,6 +1015,7 @@ else:
         "전체 SELL-IN에 포함",
         options=all_customers,
         default=[],
+        format_func=lambda key: sidebar_customer_labels.get(key, key),
         placeholder="포함할 거래처 검색",
         help="아무 거래처도 선택하지 않으면 전체 거래처가 포함됩니다.",
     )
@@ -1060,18 +1154,19 @@ st.caption(
 customer_summary = make_customer_summary(filtered)
 sku_summary = make_sku_summary(filtered)
 monthly_summary = make_monthly_summary(filtered)
+customer_label_map = customer_summary.set_index("거래처")["거래처표시"].to_dict()
 
 # ---------------------------------------------------------------------
 # 탭
 # ---------------------------------------------------------------------
 tab_summary, tab_continent, tab_customer, tab_sku, tab_org, tab_quality = st.tabs(
     [
-        "전체 요약",
-        "대륙 분석",
-        "거래처 분석",
-        "SKU 분석",
-        "조직·지역·창고",
-        "데이터 품질",
+        "1. 전체 요약",
+        "2. 대륙 분석",
+        "3. 거래처 분석",
+        "4. SKU 분석",
+        "5. 조직·지역·창고",
+        "6. 데이터 품질",
     ]
 )
 
@@ -1088,24 +1183,46 @@ with tab_summary:
         format_number(total_qty),
         help="정상 출고와 반품(음수 출고)을 합산한 수량입니다.",
     )
-    k2.metric("출고금액 (원)", format_number(total_amount))
+    k2.metric("출고금액 (천원)", format_number(total_amount / 1_000))
 
     st.subheader("전체 Top 20 SKU · 출고수량 기준")
     summary_sku_display = sku_summary.head(20).copy()
     summary_sku_display.insert(0, "순위", range(1, len(summary_sku_display) + 1))
+    summary_sku_display["출고금액"] = summary_sku_display["출고금액"] / 1_000
     summary_sku_display = summary_sku_display.rename(
-        columns={"제품명_정리": "제품명", "출고금액": "출고금액(원)"}
+        columns={
+            "제품명_정리": "제품명",
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
     )
-    st.dataframe(
-        style_table(
-            summary_sku_display[
-                ["순위", "SKU", "제품명", "출고수량", "출고금액(원)"]
-            ]
+    st.plotly_chart(
+        top_n_chart(
+            sku_summary,
+            "제품명_정리",
+            "출고수량",
+            "전체 Top 20 SKU · 출고수량 (개)",
+            top_n=min(20, max(1, len(sku_summary))),
         ),
         width="stretch",
-        hide_index=True,
-        height=735,
     )
+    with st.expander("Top 20 SKU 상세 표", expanded=False):
+        st.dataframe(
+            style_table(
+                summary_sku_display[
+                    [
+                        "순위",
+                        "SKU",
+                        "제품명",
+                        "출고수량 (개)",
+                        "출고금액 (천원)",
+                    ]
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+            height=735,
+        )
 
     trend_granularity = st.radio(
         "출고수량 추이 단위",
@@ -1114,22 +1231,24 @@ with tab_summary:
         key="summary_quantity_granularity",
     )
     quantity_trend = make_quantity_trend(filtered, trend_granularity)
-    trend_fig = px.line(
+    trend_fig = px.bar(
         quantity_trend,
         x="기간",
         y="출고수량",
-        markers=True,
-        title=f"{trend_granularity} SELL-IN 출고수량 추이",
+        text="출고수량",
+        title=f"{trend_granularity} SELL-IN 출고수량 추이 (개)",
+        color_discrete_sequence=["#2563EB"],
     )
     trend_fig.update_traces(
-        line=dict(color="#2563EB", width=3),
-        marker=dict(size=7),
+        texttemplate="%{text:,.0f}",
+        textposition="outside",
+        cliponaxis=False,
         hovertemplate="기간: %{x}<br>출고수량: %{y:,.0f}<extra></extra>",
     )
     trend_fig.update_layout(
         height=430,
         xaxis_title="",
-        yaxis_title="출고수량",
+        yaxis_title="출고수량 (개)",
         yaxis_tickformat=",.0f",
         hovermode="x unified",
         margin=dict(l=20, r=20, t=55, b=20),
@@ -1139,18 +1258,27 @@ with tab_summary:
     st.plotly_chart(
         top_n_chart(
             customer_summary,
-            "거래처명",
+            "거래처표시",
             "출고금액",
-            "Top 거래처 · 출고금액 및 전체 비중",
+            "Top 거래처 · 출고금액 (천원)",
             top_n=10,
         ),
         width="stretch",
     )
 
     st.subheader("월별 요약")
-    monthly_display = monthly_summary.rename(columns={"출고금액": "출고금액(원)"})
+    monthly_display = monthly_summary.copy()
+    monthly_display["출고금액"] = monthly_display["출고금액"] / 1_000
+    monthly_display = monthly_display.rename(
+        columns={
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
+    )
     st.dataframe(
-        style_table(monthly_display[["연월", "출고수량", "출고금액(원)"]]),
+        style_table(
+            monthly_display[["연월", "출고수량 (개)", "출고금액 (천원)"]]
+        ),
         width="stretch",
         hide_index=True,
     )
@@ -1231,22 +1359,16 @@ with tab_continent:
 
     left, right = st.columns(2)
     with left:
-        continent_bar = px.bar(
-            continent_summary.sort_values("출고수량"),
-            x="출고수량",
-            y="대륙",
-            orientation="h",
-            text_auto=".3s",
-            title="대륙별 출고수량",
-            hover_data=["거래처수", "SKU수", "출고수량", "출고금액"],
+        st.plotly_chart(
+            top_n_chart(
+                continent_summary,
+                "대륙",
+                "출고수량",
+                "대륙별 출고수량 (개)",
+                top_n=max(1, len(continent_summary)),
+            ),
+            width="stretch",
         )
-        continent_bar.update_layout(
-            height=470,
-            yaxis_title="",
-            xaxis_title="출고수량",
-            margin=dict(l=20, r=20, t=55, b=20),
-        )
-        st.plotly_chart(continent_bar, width="stretch")
 
     with right:
         continent_line = px.line(
@@ -1260,19 +1382,30 @@ with tab_continent:
         continent_line.update_layout(
             height=470,
             xaxis_title="",
-            yaxis_title="출고수량",
+            yaxis_title="출고수량 (개)",
             margin=dict(l=20, r=20, t=55, b=20),
         )
         st.plotly_chart(continent_line, width="stretch")
 
     st.subheader("대륙별 요약")
-    continent_display = continent_summary.rename(
-        columns={"출고금액": "출고금액(원)"}
+    continent_display = continent_summary.copy()
+    continent_display["출고금액"] = continent_display["출고금액"] / 1_000
+    continent_display = continent_display.rename(
+        columns={
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
     )
     st.dataframe(
         style_table(
             continent_display[
-                ["대륙", "출고수량", "출고금액(원)", "비중", "전월대비수량"]
+                [
+                    "대륙",
+                    "출고수량 (개)",
+                    "출고금액 (천원)",
+                    "비중",
+                    "전월대비수량",
+                ]
             ],
             percent_cols=["비중", "전월대비수량"],
         ),
@@ -1297,10 +1430,10 @@ with tab_continent:
         st.plotly_chart(
             top_n_chart(
                 detail_customer,
-                "거래처명",
+                "거래처표시",
                 "출고금액",
-                f"{selected_continent_detail} · Top 거래처 (출고금액)",
-                top_n=min(15, max(1, len(detail_customer))),
+                f"{selected_continent_detail} · Top 거래처 출고금액 (천원)",
+                top_n=min(20, max(1, len(detail_customer))),
             ),
             width="stretch",
         )
@@ -1310,8 +1443,8 @@ with tab_continent:
                 detail_sku,
                 "제품명_정리",
                 "출고수량",
-                f"{selected_continent_detail} · Top SKU (출고수량)",
-                top_n=min(15, max(1, len(detail_sku))),
+                f"{selected_continent_detail} · Top 20 SKU 출고수량 (개)",
+                top_n=min(20, max(1, len(detail_sku))),
             ),
             width="stretch",
         )
@@ -1343,17 +1476,23 @@ with tab_customer:
 
     customer_display = customer_summary.head(top_customer_count).copy()
     customer_display.insert(0, "순위", range(1, len(customer_display) + 1))
-    customer_main_display = customer_display.rename(
-        columns={"출고금액": "출고금액(원)"}
+    customer_main_display = customer_display.copy()
+    customer_main_display["출고금액"] = customer_main_display["출고금액"] / 1_000
+    customer_main_display = customer_main_display.rename(
+        columns={
+            "거래처표시": "대륙 | 거래처명",
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
     )
     st.dataframe(
         style_table(
             customer_main_display[
                 [
                     "순위",
-                    "거래처명",
-                    "출고수량",
-                    "출고금액(원)",
+                    "대륙 | 거래처명",
+                    "출고수량 (개)",
+                    "출고금액 (천원)",
                     "금액비중",
                 ]
             ],
@@ -1367,29 +1506,44 @@ with tab_customer:
     st.plotly_chart(
         top_n_chart(
             customer_summary,
-            "거래처명",
+            "거래처표시",
             "출고금액",
-            f"Top {top_customer_count} 거래처 · 출고금액 및 전체 비중",
+            f"Top {top_customer_count} 거래처 · 출고금액 (천원)",
             top_n=top_customer_count,
         ),
         width="stretch",
     )
 
     with st.expander("거래처 순위 상세 지표", expanded=False):
+        customer_detail_display = customer_display.copy()
+        customer_detail_display["출고금액"] = (
+            customer_detail_display["출고금액"] / 1_000
+        )
+        customer_detail_display["건당평균금액"] = (
+            customer_detail_display["건당평균금액"] / 1_000
+        )
+        customer_detail_display = customer_detail_display.rename(
+            columns={
+                "거래처표시": "대륙 | 거래처명",
+                "출고수량": "출고수량 (개)",
+                "출고금액": "출고금액 (천원)",
+                "건당평균금액": "건당평균금액 (천원)",
+            }
+        )
         st.dataframe(
             style_table(
-                customer_display[
+                customer_detail_display[
                     [
                         "순위",
-                        "거래처명",
+                        "대륙 | 거래처명",
                         "거래처코드",
-                        "출고수량",
-                        "출고금액",
+                        "출고수량 (개)",
+                        "출고금액 (천원)",
                         "금액비중",
                         "수량비중",
                         "SKU수",
                         "출고건수",
-                        "건당평균금액",
+                        "건당평균금액 (천원)",
                         "최근출고일",
                     ]
                 ],
@@ -1404,8 +1558,9 @@ with tab_customer:
     selected_customer = st.selectbox(
         "상세 분석 거래처",
         options=customer_summary["거래처"].tolist(),
-        format_func=lambda key: key,
+        format_func=lambda key: customer_label_map.get(key, key),
     )
+    selected_customer_label = customer_label_map.get(selected_customer, selected_customer)
     customer_df = filtered[filtered["거래처"].eq(selected_customer)].copy()
 
     selected_customer_summary = customer_summary[
@@ -1413,8 +1568,11 @@ with tab_customer:
     ].iloc[0]
 
     a, b, c, d = st.columns(4)
-    a.metric("출고수량", format_number(selected_customer_summary["출고수량"]))
-    b.metric("출고금액 (원)", format_number(selected_customer_summary["출고금액"]))
+    a.metric("출고수량 (개)", format_number(selected_customer_summary["출고수량"]))
+    b.metric(
+        "출고금액 (천원)",
+        format_number(selected_customer_summary["출고금액"] / 1_000),
+    )
     c.metric("거래 SKU", format_number(selected_customer_summary["SKU수"]))
     d.metric("전체 금액 비중", format_pct(selected_customer_summary["금액비중"]))
 
@@ -1427,13 +1585,18 @@ with tab_customer:
             customer_monthly,
             x="연월",
             y="출고수량",
-            title=f"{selected_customer} · 월별 출고수량",
-            text_auto=".3s",
+            title=f"{selected_customer_label} · 월별 출고수량 (개)",
+            text="출고수량",
+        )
+        fig.update_traces(
+            texttemplate="%{text:,.0f}",
+            textposition="outside",
+            cliponaxis=False,
         )
         fig.update_layout(
             height=420,
             xaxis_title="",
-            yaxis_title="출고수량",
+            yaxis_title="출고수량 (개)",
             margin=dict(l=20, r=20, t=55, b=20),
         )
         st.plotly_chart(fig, width="stretch")
@@ -1444,8 +1607,8 @@ with tab_customer:
                 customer_sku,
                 "제품명_정리",
                 "출고수량",
-                f"{selected_customer} · Top SKU (출고수량)",
-                top_n=min(15, max(5, len(customer_sku))),
+                f"{selected_customer_label} · Top 20 SKU 출고수량 (개)",
+                top_n=min(20, max(1, len(customer_sku))),
             ),
             width="stretch",
         )
@@ -1459,10 +1622,15 @@ with tab_customer:
         key="heatmap_top_n",
     )
     top_customer_keys = customer_summary.head(heatmap_top_n)["거래처"].tolist()
-    heatmap_source = filtered[filtered["거래처"].isin(top_customer_keys)]
+    heatmap_source = filtered[filtered["거래처"].isin(top_customer_keys)].copy()
+    heatmap_source["거래처표시"] = (
+        heatmap_source["대륙"].astype("string").fillna("미지정")
+        + " | "
+        + heatmap_source["거래처명"].astype("string").fillna("미기재")
+    )
     heatmap_df = (
         heatmap_source.pivot_table(
-            index="거래처명",
+            index="거래처표시",
             columns="연월",
             values="분석수량",
             aggfunc="sum",
@@ -1475,8 +1643,8 @@ with tab_customer:
             heatmap_df,
             aspect="auto",
             text_auto=".3s",
-            title=f"Top {heatmap_top_n} 거래처 월별 출고수량",
-            labels=dict(x="연월", y="거래처", color="출고수량"),
+            title=f"Top {heatmap_top_n} 거래처 월별 출고수량 (개)",
+            labels=dict(x="연월", y="거래처", color="출고수량 (개)"),
         )
         fig.update_layout(height=max(450, heatmap_top_n * 28))
         st.plotly_chart(fig, width="stretch")
@@ -1501,8 +1669,13 @@ with tab_sku:
 
     sku_display = sku_summary.copy()
     sku_display.insert(0, "순위", range(1, len(sku_display) + 1))
+    sku_display["출고금액"] = sku_display["출고금액"] / 1_000
     sku_display = sku_display.rename(
-        columns={"제품명_정리": "제품명", "출고금액": "출고금액(원)"}
+        columns={
+            "제품명_정리": "제품명",
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
     )
 
     st.dataframe(
@@ -1512,8 +1685,8 @@ with tab_sku:
                     "순위",
                     "SKU",
                     "제품명",
-                    "출고수량",
-                    "출고금액(원)",
+                    "출고수량 (개)",
+                    "출고금액 (천원)",
                 ]
             ]
         ),
@@ -1522,44 +1695,16 @@ with tab_sku:
         height=780,
     )
 
-    left, right = st.columns(2)
-    with left:
-        st.plotly_chart(
-            top_n_chart(
-                sku_summary,
-                "제품명_정리",
-                "출고수량",
-                "전체 Top 20 SKU · 출고수량",
-                top_n=min(20, max(1, len(sku_summary))),
-            ),
-            width="stretch",
-        )
-
-    with right:
-        group_summary = (
-            filtered.groupby("제품군_분석", as_index=False)
-            .agg(
-                출고수량=("분석수량", "sum"),
-                출고금액=("분석금액", "sum"),
-                SKU수=("SKU", "nunique"),
-            )
-            .sort_values("출고수량", ascending=False)
-        )
-        fig = px.bar(
-            group_summary.head(15).sort_values("출고수량"),
-            x="출고수량",
-            y="제품군_분석",
-            orientation="h",
-            text_auto=".3s",
-            title="제품군별 출고수량",
-        )
-        fig.update_layout(
-            height=500,
-            yaxis_title="",
-            xaxis_title="출고수량",
-            margin=dict(l=20, r=20, t=55, b=20),
-        )
-        st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(
+        top_n_chart(
+            sku_summary,
+            "제품명_정리",
+            "출고수량",
+            "전체 Top 20 SKU · 출고수량 (개)",
+            top_n=min(20, max(1, len(sku_summary))),
+        ),
+        width="stretch",
+    )
 
     st.subheader("거래처별 Top SKU")
     rank_top_n = st.slider(
@@ -1570,33 +1715,13 @@ with tab_sku:
         key="customer_sku_rank_top_n",
     )
 
-    customer_sku_rank = (
-        filtered.groupby(
-            ["거래처", "거래처명", "거래처코드", "SKU"],
-            as_index=False,
-        )
-        .agg(
-            출고수량=("분석수량", "sum"),
-            출고금액=("분석금액", "sum"),
-            제품명_정리=("제품명_정리", representative_text),
-        )
-    )
-    customer_sku_rank["거래처내순위"] = (
-        customer_sku_rank.groupby("거래처")["출고수량"]
-        .rank(method="dense", ascending=False)
-        .astype(int)
-    )
-    customer_sku_rank = customer_sku_rank[
-        customer_sku_rank["거래처내순위"] <= rank_top_n
-    ].sort_values(
-        ["거래처명", "거래처내순위", "출고수량"],
-        ascending=[True, True, False],
-    )
+    customer_sku_rank = make_customer_sku_rank(filtered, rank_top_n)
 
     customer_for_rank = st.multiselect(
         "표시할 거래처",
         options=customer_summary["거래처"].tolist(),
-        default=customer_summary.head(min(10, len(customer_summary)))["거래처"].tolist(),
+        default=customer_summary.head(min(5, len(customer_summary)))["거래처"].tolist(),
+        format_func=lambda key: customer_label_map.get(key, key),
         help="기본값은 전체 금액 상위 거래처입니다.",
     )
     if customer_for_rank:
@@ -1604,17 +1729,27 @@ with tab_sku:
             customer_sku_rank["거래처"].isin(customer_for_rank)
         ]
 
+    customer_sku_display = customer_sku_rank.copy()
+    customer_sku_display["출고금액"] = customer_sku_display["출고금액"] / 1_000
+    customer_sku_display = customer_sku_display.rename(
+        columns={
+            "거래처표시": "대륙 | 거래처명",
+            "제품명_정리": "제품명",
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
+    )
     st.dataframe(
         style_table(
-            customer_sku_rank[
+            customer_sku_display[
                 [
-                    "거래처명",
+                    "대륙 | 거래처명",
                     "거래처코드",
                     "거래처내순위",
                     "SKU",
-                    "제품명_정리",
-                    "출고수량",
-                    "출고금액",
+                    "제품명",
+                    "출고수량 (개)",
+                    "출고금액 (천원)",
                 ]
             ]
         ),
@@ -1647,8 +1782,16 @@ with tab_sku:
         )
         .sort_values("ABC등급")
     )
+    abc_display = abc_summary.copy()
+    abc_display["출고금액"] = abc_display["출고금액"] / 1_000
+    abc_display = abc_display.rename(
+        columns={
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
+    )
     st.dataframe(
-        style_table(abc_summary),
+        style_table(abc_display),
         width="stretch",
         hide_index=True,
     )
@@ -1696,12 +1839,12 @@ with tab_org:
             y=org_dimension,
             orientation="h",
             text_auto=".3s",
-            title=f"{org_dimension}별 출고수량",
+            title=f"{org_dimension}별 출고수량 (개)",
         )
         fig.update_layout(
             height=550,
             yaxis_title="",
-            xaxis_title="출고수량",
+            xaxis_title="출고수량 (개)",
             margin=dict(l=20, r=20, t=55, b=20),
         )
         st.plotly_chart(fig, width="stretch")
@@ -1717,15 +1860,23 @@ with tab_org:
         fig.update_layout(height=550)
         st.plotly_chart(fig, width="stretch")
 
+    org_display = org_summary.copy()
+    org_display["출고금액"] = org_display["출고금액"] / 1_000
+    org_display = org_display.rename(
+        columns={
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
+    )
     st.dataframe(
-        style_table(org_summary, percent_cols=["비중"]),
+        style_table(org_display, percent_cols=["비중"]),
         width="stretch",
         hide_index=True,
     )
 
     st.subheader("담당자 × 거래처")
     owner_customer = (
-        filtered.groupby(["영업담당자명", "거래처명"], as_index=False)
+        filtered.groupby(["영업담당자명", "대륙", "거래처명"], as_index=False)
         .agg(
             출고수량=("분석수량", "sum"),
             출고금액=("분석금액", "sum"),
@@ -1733,8 +1884,30 @@ with tab_org:
         )
         .sort_values("출고수량", ascending=False)
     )
+    owner_customer["대륙 | 거래처명"] = (
+        owner_customer["대륙"].astype("string").fillna("미지정")
+        + " | "
+        + owner_customer["거래처명"].astype("string").fillna("미기재")
+    )
+    owner_customer["출고금액"] = owner_customer["출고금액"] / 1_000
+    owner_customer = owner_customer.rename(
+        columns={
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
+    )
     st.dataframe(
-        style_table(owner_customer.head(100)),
+        style_table(
+            owner_customer.head(100)[
+                [
+                    "영업담당자명",
+                    "대륙 | 거래처명",
+                    "출고수량 (개)",
+                    "출고금액 (천원)",
+                    "SKU수",
+                ]
+            ]
+        ),
         width="stretch",
         hide_index=True,
         height=520,
@@ -1794,9 +1967,9 @@ with tab_quality:
     return_qty = -df.loc[df["분석수량"] < 0, "분석수량"].sum()
     net_qty = df["분석수량"].sum()
     r1, r2, r3 = st.columns(3)
-    r1.metric("정상 출고수량", format_number(positive_qty))
-    r2.metric("반품수량", format_number(return_qty))
-    r3.metric("순출고수량", format_number(net_qty))
+    r1.metric("정상 출고수량 (개)", format_number(positive_qty))
+    r2.metric("반품수량 (개)", format_number(return_qty))
+    r3.metric("순출고수량 (개)", format_number(net_qty))
 
     issue_table = pd.DataFrame(
         [
