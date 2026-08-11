@@ -648,7 +648,9 @@ def top_n_chart(
         text="_내부텍스트",
         title=title,
         custom_data=[value, "_비중"],
-        category_orders={"_표시명": chart_df["_표시명"].tolist()[::-1]},
+        # 순위 배열은 1위부터 유지하고, 아래에서 y축 자체를 반전해
+        # Plotly 버전에 관계없이 첫 번째 범주(1위)가 맨 위에 오게 합니다.
+        category_orders={"_표시명": chart_df["_표시명"].tolist()},
         color_discrete_sequence=["#2563EB"],
     )
     fig.update_traces(
@@ -685,6 +687,11 @@ def top_n_chart(
     )
     if max_value > 0:
         fig.update_xaxes(range=[0, max_value * 1.16])
+    fig.update_yaxes(
+        categoryorder="array",
+        categoryarray=chart_df["_표시명"].tolist(),
+        autorange="reversed",
+    )
     return fig
 
 
@@ -1205,6 +1212,7 @@ with tab_summary:
             top_n=min(20, max(1, len(sku_summary))),
         ),
         width="stretch",
+        key="summary_top20_sku_chart",
     )
     with st.expander("Top 20 SKU 상세 표", expanded=False):
         st.dataframe(
@@ -1253,7 +1261,11 @@ with tab_summary:
         hovermode="x unified",
         margin=dict(l=20, r=20, t=55, b=20),
     )
-    st.plotly_chart(trend_fig, width="stretch")
+    st.plotly_chart(
+        trend_fig,
+        width="stretch",
+        key="summary_quantity_trend_chart",
+    )
 
     st.plotly_chart(
         top_n_chart(
@@ -1264,6 +1276,7 @@ with tab_summary:
             top_n=10,
         ),
         width="stretch",
+        key="summary_top_customer_amount_chart",
     )
 
     st.subheader("월별 요약")
@@ -1368,6 +1381,7 @@ with tab_continent:
                 top_n=max(1, len(continent_summary)),
             ),
             width="stretch",
+            key="continent_quantity_chart",
         )
 
     with right:
@@ -1385,7 +1399,11 @@ with tab_continent:
             yaxis_title="출고수량 (개)",
             margin=dict(l=20, r=20, t=55, b=20),
         )
-        st.plotly_chart(continent_line, width="stretch")
+        st.plotly_chart(
+            continent_line,
+            width="stretch",
+            key="continent_monthly_trend_chart",
+        )
 
     st.subheader("대륙별 요약")
     continent_display = continent_summary.copy()
@@ -1436,6 +1454,7 @@ with tab_continent:
                 top_n=min(20, max(1, len(detail_customer))),
             ),
             width="stretch",
+            key="continent_detail_customer_chart",
         )
     with right:
         st.plotly_chart(
@@ -1447,6 +1466,7 @@ with tab_continent:
                 top_n=min(20, max(1, len(detail_sku))),
             ),
             width="stretch",
+            key="continent_detail_sku_chart",
         )
 
     continent_csv = continent_summary.to_csv(
@@ -1512,6 +1532,7 @@ with tab_customer:
             top_n=top_customer_count,
         ),
         width="stretch",
+        key="customer_ranking_amount_chart",
     )
 
     with st.expander("거래처 순위 상세 지표", expanded=False):
@@ -1599,7 +1620,11 @@ with tab_customer:
             yaxis_title="출고수량 (개)",
             margin=dict(l=20, r=20, t=55, b=20),
         )
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            key="customer_detail_monthly_chart",
+        )
 
     with right:
         st.plotly_chart(
@@ -1611,6 +1636,7 @@ with tab_customer:
                 top_n=min(20, max(1, len(customer_sku))),
             ),
             width="stretch",
+            key="customer_detail_top20_sku_chart",
         )
 
     st.subheader("거래처 × 월 히트맵")
@@ -1647,7 +1673,11 @@ with tab_customer:
             labels=dict(x="연월", y="거래처", color="출고수량 (개)"),
         )
         fig.update_layout(height=max(450, heatmap_top_n * 28))
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            key="customer_monthly_heatmap_chart",
+        )
 
     customer_csv = customer_summary.to_csv(index=False, encoding="utf-8-sig")
     st.download_button(
@@ -1704,6 +1734,7 @@ with tab_sku:
             top_n=min(20, max(1, len(sku_summary))),
         ),
         width="stretch",
+        key="sku_analysis_top20_chart",
     )
 
     st.subheader("거래처별 Top SKU")
@@ -1833,8 +1864,9 @@ with tab_org:
 
     left, right = st.columns([1.2, 1])
     with left:
+        org_chart_df = org_summary.head(20).copy()
         fig = px.bar(
-            org_summary.head(20).sort_values("출고수량"),
+            org_chart_df,
             x="출고수량",
             y=org_dimension,
             orientation="h",
@@ -1847,7 +1879,16 @@ with tab_org:
             xaxis_title="출고수량 (개)",
             margin=dict(l=20, r=20, t=55, b=20),
         )
-        st.plotly_chart(fig, width="stretch")
+        fig.update_yaxes(
+            categoryorder="array",
+            categoryarray=org_chart_df[org_dimension].tolist(),
+            autorange="reversed",
+        )
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            key="organization_quantity_chart",
+        )
 
     with right:
         fig = px.pie(
@@ -1858,7 +1899,11 @@ with tab_org:
             title=f"상위 10개 {org_dimension} 출고수량 비중",
         )
         fig.update_layout(height=550)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            key="organization_share_chart",
+        )
 
     org_display = org_summary.copy()
     org_display["출고금액"] = org_display["출고금액"] / 1_000
