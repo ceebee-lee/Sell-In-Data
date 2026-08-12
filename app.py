@@ -58,6 +58,19 @@ CONTINENT_OPTIONS = [
     "기타",
 ]
 
+PRODUCT_MAPPING_COLUMNS = [
+    "품목코드",
+    "품목명",
+    "대분류",
+    "제품군",
+    "판매형태",
+    "에디션",
+    "시장사양",
+    "기본분석포함",
+    "검토상태",
+    "검토사유",
+]
+
 AMOUNT_POLICY_ADJUSTED = "조정출고금액 우선 (공란만 출고금액 대체)"
 AMOUNT_POLICY_ZERO_AS_BLANK = "조정출고금액 0도 미입력으로 간주"
 AMOUNT_POLICY_ORIGINAL = "출고금액만 사용"
@@ -84,6 +97,29 @@ def safe_numeric(series: pd.Series) -> pd.Series:
         .str.replace(r"(원|개)$", "", regex=True)
     )
     return pd.to_numeric(cleaned, errors="coerce")
+
+
+def safe_datetime(series: pd.Series) -> pd.Series:
+    """일반 날짜, YYYYMMDD 숫자, Excel 일련번호를 함께 안전하게 변환."""
+    parsed = pd.to_datetime(series, errors="coerce", format="mixed")
+    numeric = pd.to_numeric(series, errors="coerce")
+
+    excel_serial = numeric.between(20_000, 80_000, inclusive="both")
+    if excel_serial.any():
+        parsed.loc[excel_serial] = pd.Timestamp("1899-12-30") + pd.to_timedelta(
+            numeric.loc[excel_serial],
+            unit="D",
+        )
+
+    compact_date = numeric.between(19_000_101, 21_001_231, inclusive="both")
+    if compact_date.any():
+        compact_text = numeric.loc[compact_date].round().astype("Int64").astype("string")
+        parsed.loc[compact_date] = pd.to_datetime(
+            compact_text,
+            format="%Y%m%d",
+            errors="coerce",
+        )
+    return parsed
 
 
 def nonblank_mask(series: pd.Series) -> pd.Series:
@@ -185,13 +221,13 @@ def normalize_continent(value: object) -> str:
     return text if text in CONTINENT_OPTIONS else "기타"
 
 
-@st.cache_data(show_spinner=False)
 def get_sheet_names(file_bytes: bytes) -> list[str]:
+    """업로드된 파일의 시트명을 세션 실행 중 직접 읽습니다."""
     return pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl").sheet_names
 
 
-@st.cache_data(show_spinner="엑셀 데이터를 불러오는 중입니다.")
 def load_excel(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    """업로드된 SELL-IN 데이터를 서버 공용 캐시에 저장하지 않고 읽습니다."""
     return pd.read_excel(
         io.BytesIO(file_bytes),
         sheet_name=sheet_name,
@@ -199,7 +235,6 @@ def load_excel(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     )
 
 
-@st.cache_data(show_spinner=False)
 def load_continent_mapping(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     """CSV/XLSX 형식의 거래처-대륙 매핑 파일을 불러옵니다."""
     suffix = Path(file_name).suffix.lower()
@@ -278,7 +313,180 @@ def apply_continent_mapping(
     return result
 
 
-@st.cache_data(show_spinner=False)
+def load_product_mapping(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """CSV/XLSX 형식의 SKU-제품군 매핑 파일을 검증해 불러옵니다."""
+    suffix = Path(file_name).suffix.lower()
+    buffer = io.BytesIO(file_bytes)
+
+    if suffix == ".csv":
+        try:
+            mapping = pd.read_csv(buffer, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            buffer.seek(0)
+            mapping = pd.read_csv(buffer, encoding="cp949")
+    elif suffix in {".xlsx", ".xlsm"}:
+        workbook = pd.ExcelFile(buffer, engine="openpyxl")
+        target_sheet = (
+            "제품군 매핑"
+            if "제품군 매핑" in workbook.sheet_names
+            else workbook.sheet_names[0]
+        )
+        mapping = pd.read_excel(workbook, sheet_name=target_sheet)
+    else:
+        raise ValueError("제품군 매핑 파일은 CSV 또는 XLSX 형식만 지원합니다.")
+
+    mapping.columns = [clean_column_name(col) for col in mapping.columns]
+    required = ["품목코드", "대분류", "제품군"]
+    missing = [col for col in required if col not in mapping.columns]
+    if missing:
+        raise ValueError("필수 컬럼이 없습니다: " + ", ".join(missing))
+
+    for col in PRODUCT_MAPPING_COLUMNS:
+        if col not in mapping.columns:
+            mapping[col] = ""
+        mapping[col] = mapping[col].astype("string").fillna("").str.strip()
+
+    mapping = mapping[mapping["품목코드"].ne("")].copy()
+    if mapping.empty:
+        raise ValueError("품목코드가 입력된 매핑 행이 없습니다.")
+
+    duplicate_codes = sort_unique(
+        mapping.loc[
+            mapping.duplicated("품목코드", keep=False),
+            "품목코드",
+        ]
+    )
+    if duplicate_codes:
+        preview = ", ".join(duplicate_codes[:5])
+        suffix_text = " 외" if len(duplicate_codes) > 5 else ""
+        raise ValueError(
+            f"중복 품목코드가 {len(duplicate_codes):,}개 있습니다: "
+            f"{preview}{suffix_text}"
+        )
+
+    for col in ["대분류", "제품군", "판매형태", "에디션", "시장사양"]:
+        mapping[col] = mapping[col].mask(mapping[col].eq(""), "미분류")
+    mapping["기본분석포함"] = mapping["기본분석포함"].where(
+        mapping["기본분석포함"].isin(["포함", "제외"]),
+        "포함",
+    )
+    mapping["검토상태"] = mapping["검토상태"].mask(
+        mapping["검토상태"].eq(""),
+        "미확인",
+    )
+    return mapping[PRODUCT_MAPPING_COLUMNS].copy()
+
+
+def apply_product_mapping(
+    sellin_df: pd.DataFrame,
+    mapping_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """품목코드(SKU) 기준으로 제품 분류를 m:1 연결합니다."""
+    result = sellin_df.copy()
+    mapping = mapping_df.copy()
+
+    # 재적용 시 기존 매핑 컬럼이 남아 접미사가 붙지 않도록 제거합니다.
+    mapped_columns = [
+        "품목코드",
+        "매핑품목명",
+        "대분류",
+        "제품군",
+        "판매형태",
+        "에디션",
+        "시장사양",
+        "기본분석포함",
+        "검토상태",
+        "검토사유",
+        "제품군매핑상태",
+        "대분류_분석",
+    ]
+    result = result.drop(
+        columns=[col for col in mapped_columns if col in result.columns],
+        errors="ignore",
+    )
+
+    mapping = mapping.rename(columns={"품목명": "매핑품목명"})
+    result = result.merge(
+        mapping,
+        left_on="SKU",
+        right_on="품목코드",
+        how="left",
+        validate="m:1",
+    )
+
+    matched = result["품목코드"].notna()
+    result["제품군매핑상태"] = np.where(matched, "매핑완료", "미분류")
+    for col in ["대분류", "제품군", "판매형태", "에디션", "시장사양"]:
+        result[col] = (
+            result[col].astype("string").fillna("").str.strip().replace("", "미분류")
+        )
+    result["기본분석포함"] = (
+        result["기본분석포함"]
+        .astype("string")
+        .fillna("포함")
+        .where(lambda values: values.isin(["포함", "제외"]), "포함")
+    )
+    result["검토상태"] = (
+        result["검토상태"].astype("string").fillna("미확인").replace("", "미확인")
+    )
+    result["검토사유"] = result["검토사유"].astype("string").fillna("")
+    result["제품군_분석"] = result["제품군"]
+    result["대분류_분석"] = result["대분류"]
+
+    sku_master = result[result["SKU"].ne("")][
+        ["SKU", "제품명_정리", "제품군매핑상태"]
+    ].drop_duplicates("SKU")
+    unmatched_skus = (
+        sku_master[sku_master["제품군매핑상태"].eq("미분류")]
+        .rename(columns={"SKU": "품목코드", "제품명_정리": "품목명"})
+        [["품목코드", "품목명"]]
+        .sort_values("품목코드")
+        .reset_index(drop=True)
+    )
+    total_skus = int(sku_master["SKU"].nunique())
+    matched_skus = total_skus - len(unmatched_skus)
+    quality = {
+        "total_skus": total_skus,
+        "matched_skus": matched_skus,
+        "unmatched_sku_count": len(unmatched_skus),
+        "unmatched_skus": unmatched_skus,
+        "matched_row_count": int(matched.sum()),
+        "unmatched_row_count": int((~matched).sum()),
+        "review_sku_count": int(
+            result.loc[result["검토상태"].eq("검토필요"), "SKU"].nunique()
+        ),
+    }
+    return result, quality
+
+
+def make_product_group_summary(
+    df: pd.DataFrame,
+    dimension: str = "제품군",
+) -> pd.DataFrame:
+    """대분류 또는 제품군 단위의 수량·금액·구성비 요약을 생성합니다."""
+    result = (
+        df.groupby(dimension, as_index=False, dropna=False)
+        .agg(
+            출고수량=("분석수량", "sum"),
+            출고금액=("분석금액", "sum"),
+            SKU수=("SKU", "nunique"),
+            거래처수=("거래처", "nunique"),
+            대륙수=("대륙", "nunique"),
+        )
+        .sort_values(["출고수량", "출고금액"], ascending=False)
+        .reset_index(drop=True)
+    )
+    total_qty = result["출고수량"].sum()
+    total_amount = result["출고금액"].sum()
+    result["수량비중"] = np.where(total_qty != 0, result["출고수량"] / total_qty, 0)
+    result["금액비중"] = np.where(
+        total_amount != 0,
+        result["출고금액"] / total_amount,
+        0,
+    )
+    return result
+
+
 def prepare_data(
     raw_df: pd.DataFrame,
     amount_policy: str = AMOUNT_POLICY_ADJUSTED,
@@ -304,7 +512,7 @@ def prepare_data(
     # 날짜 변환
     for col in DATE_COLUMNS:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+            df[col] = safe_datetime(df[col])
 
     # 숫자 변환: 변환 실패를 조용히 0으로 처리하지 않고 별도 보고합니다.
     numeric_issue_frames: list[pd.DataFrame] = []
@@ -508,6 +716,11 @@ def make_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
             제품명_정리=("제품명_정리", representative_text),
             제품버전=("제품버전", representative_text),
             제품군_분석=("제품군_분석", representative_text),
+            대분류=("대분류", representative_text),
+            제품군=("제품군", representative_text),
+            판매형태=("판매형태", representative_text),
+            에디션=("에디션", representative_text),
+            검토상태=("검토상태", representative_text),
         )
         .reset_index()
     )
@@ -710,19 +923,40 @@ def find_potential_duplicates(
     """출고번호 유무에 따라 중복 후보 기준을 분리해 오탐을 줄입니다."""
     mask = pd.Series(False, index=df.index)
     if shipment_number_present and "출고번호" in df.columns:
-        key_cols = [
+        shipment_key_cols = [
             col
             for col in ["출고번호", "출고순번", "수불번호", "수불순번", "품목"]
             if col in df.columns
         ]
         valid = df["출고번호"].astype("string").fillna("").str.strip()
         valid = valid.ne("") & valid.ne("미기재")
-        if key_cols:
+        if shipment_key_cols:
             mask.loc[valid] = df.loc[valid].duplicated(
-                subset=key_cols,
+                subset=shipment_key_cols,
                 keep=False,
             )
-        return mask, key_cols
+
+        # 파일 전체에 출고번호가 존재하더라도 일부 행만 공란일 수 있습니다.
+        # 그 행은 날짜·거래처·SKU·수량·금액·창고 조합으로 별도 점검합니다.
+        fallback_key_cols = [
+            col
+            for col in [
+                "출고일",
+                "거래처코드",
+                "SKU",
+                "분석수량",
+                "분석금액",
+                "창고",
+            ]
+            if col in df.columns
+        ]
+        if fallback_key_cols:
+            missing_shipment = ~valid
+            mask.loc[missing_shipment] = df.loc[missing_shipment].duplicated(
+                subset=fallback_key_cols,
+                keep=False,
+            )
+        return mask, shipment_key_cols + fallback_key_cols
 
     key_cols = [
         col
@@ -768,30 +1002,22 @@ def style_table(df: pd.DataFrame, percent_cols: list[str] | None = None):
 # ---------------------------------------------------------------------
 st.title("SELL-IN 분석 대시보드")
 st.caption(
-    "ERP 출고 데이터를 기준으로 전체 실적, 거래처, SKU, 월별 추이, 조직/창고 및 데이터 품질을 분석합니다."
+    "ERP 출고 데이터를 기준으로 전체 실적, 대륙·제품군, 거래처, SKU, 월별 추이 및 데이터 품질을 분석합니다."
 )
-
-APP_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_PATH = APP_DIR / "26년 상반기 SELL-IN 데이터.xlsx"
 
 uploaded_file = st.sidebar.file_uploader(
     "SELL-IN 엑셀 업로드",
     type=["xlsx", "xlsm"],
-    help="새 파일을 올리면 기본 예시 데이터 대신 해당 파일을 분석합니다.",
+    help=(
+        "업로드한 파일은 GitHub 저장소에 저장되지 않으며, "
+        "서버 공용 데이터 캐시를 사용하지 않고 현재 실행에서만 처리합니다."
+    ),
 )
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
     source_file_name = uploaded_file.name
     st.sidebar.success(f"업로드 데이터 사용 중: {source_file_name}")
-elif DEFAULT_DATA_PATH.is_file():
-    try:
-        file_bytes = DEFAULT_DATA_PATH.read_bytes()
-        source_file_name = DEFAULT_DATA_PATH.name
-        st.sidebar.info(f"기본 데이터 사용 중: {source_file_name}")
-    except OSError as exc:
-        st.error(f"기본 데이터를 읽을 수 없습니다: {exc}")
-        st.stop()
 else:
     st.info(
         "왼쪽 사이드바에서 SELL-IN 엑셀 파일을 업로드하면 대시보드가 시작됩니다."
@@ -805,6 +1031,8 @@ else:
         - 거래처별 Top SKU
         - 거래처·월별 출고수량 히트맵 및 실적 집중도
         - 거래처별 대륙 매핑 및 대륙별 SELL-IN 분석
+        - SKU 제품군 매핑 및 대륙 → 대분류 → 제품군 → SKU/홋수 분석
+        - 본품·미니·세트·리필 및 에디션 필터
         - 판매지역·영업그룹·담당자·창고 분석
         - 누락값·음수 출고·잠재 중복 등 데이터 품질 점검
         """
@@ -881,7 +1109,75 @@ if quality.get("numeric_failure_count", 0):
     )
 
 # ---------------------------------------------------------------------
-# 1. 거래처별 대륙 매핑
+# 1. SKU별 제품군 매핑
+# ---------------------------------------------------------------------
+st.sidebar.divider()
+st.sidebar.subheader("제품군 매핑")
+product_mapping_file = st.sidebar.file_uploader(
+    "제품군 매핑표 업로드",
+    type=["csv", "xlsx", "xlsm"],
+    key="product_mapping_upload",
+    help=(
+        "품목코드 기준으로 대분류·제품군·판매형태·에디션을 연결합니다. "
+        "공개 저장소에는 매핑표를 포함하지 않으므로 분석할 때 직접 업로드해야 합니다."
+    ),
+)
+
+if product_mapping_file is None:
+    st.info(
+        "왼쪽 사이드바에서 제품군 매핑표를 업로드하면 제품군 분석을 시작합니다."
+    )
+    st.stop()
+
+try:
+    product_mapping_bytes = product_mapping_file.getvalue()
+    product_mapping_name = product_mapping_file.name
+    st.sidebar.success(f"업로드 매핑 사용 중: {product_mapping_name}")
+    product_mapping = load_product_mapping(
+        product_mapping_bytes,
+        product_mapping_name,
+    )
+    df, product_mapping_quality = apply_product_mapping(df, product_mapping)
+except Exception as exc:
+    st.error(f"제품군 매핑을 적용할 수 없습니다: {exc}")
+    st.stop()
+
+st.sidebar.caption(
+    f"SKU 매핑 {product_mapping_quality['matched_skus']:,}/"
+    f"{product_mapping_quality['total_skus']:,}개 · "
+    f"검토 필요 {product_mapping_quality['review_sku_count']:,}개"
+)
+
+apply_default_product_scope = st.sidebar.checkbox(
+    "기본 분석 포함 SKU만 사용",
+    value=True,
+    help=(
+        "매핑표의 '기본분석포함'이 '제외'인 샘플·증정품을 전체 KPI와 "
+        "차트에서 제외합니다. 미분류 신규 SKU는 누락 방지를 위해 포함됩니다."
+    ),
+)
+
+excluded_product_sku_count = int(
+    df.loc[df["기본분석포함"].eq("제외"), "SKU"].nunique()
+)
+excluded_product_row_count = int(df["기본분석포함"].eq("제외").sum())
+if apply_default_product_scope:
+    df = df[df["기본분석포함"].eq("포함")].copy()
+    st.sidebar.caption(
+        f"샘플·증정품 등 {excluded_product_sku_count:,}개 SKU · "
+        f"{excluded_product_row_count:,}행 제외"
+    )
+
+if product_mapping_quality["unmatched_sku_count"]:
+    st.warning(
+        f"제품군이 미분류된 신규 SKU가 "
+        f"{product_mapping_quality['unmatched_sku_count']:,}개 있습니다. "
+        "분석에서는 제외하지 않고 '미분류' 제품군으로 포함했습니다. "
+        "데이터 품질 탭에서 목록을 내려받아 매핑표에 추가하세요."
+    )
+
+# ---------------------------------------------------------------------
+# 2. 거래처별 대륙 매핑
 # ---------------------------------------------------------------------
 customer_master = (
     df[["거래처", "거래처코드", "거래처명"]]
@@ -986,7 +1282,7 @@ if unassigned_customer_count:
     )
 
 # ---------------------------------------------------------------------
-# 2. 전체 분석 기준: 거래처 포함/제외
+# 3. 전체 분석 기준: 거래처 포함/제외
 # ---------------------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.subheader("전체 분석 거래처 기준")
@@ -1051,7 +1347,7 @@ if global_df.empty:
     st.stop()
 
 # ---------------------------------------------------------------------
-# 3. 공통 상세 필터
+# 4. 공통 상세 필터
 # ---------------------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.subheader("상세 필터")
@@ -1101,6 +1397,45 @@ continent_selected = st.sidebar.multiselect(
 )
 filtered = apply_multiselect_filter(filtered, "대륙", continent_selected)
 
+category_selected = st.sidebar.multiselect(
+    "대분류",
+    sort_unique(filtered["대분류"]),
+    placeholder="예: 립, 베이스",
+)
+filtered = apply_multiselect_filter(filtered, "대분류", category_selected)
+
+product_group_selected = st.sidebar.multiselect(
+    "제품군",
+    sort_unique(filtered["제품군"]),
+    placeholder="예: 듀 틴트, 젤핏 틴트",
+)
+filtered = apply_multiselect_filter(filtered, "제품군", product_group_selected)
+
+with st.sidebar.expander("판매형태·에디션 필터", expanded=False):
+    sales_type_selected = st.multiselect(
+        "판매형태",
+        sort_unique(filtered["판매형태"]),
+        placeholder="본품·미니·세트·리필",
+        key="sidebar_sales_type_filter",
+    )
+    filtered = apply_multiselect_filter(filtered, "판매형태", sales_type_selected)
+
+    edition_selected = st.multiselect(
+        "에디션",
+        sort_unique(filtered["에디션"]),
+        placeholder="예: 일반, 몬치치",
+        key="sidebar_edition_filter",
+    )
+    filtered = apply_multiselect_filter(filtered, "에디션", edition_selected)
+
+    market_selected = st.multiselect(
+        "시장사양",
+        sort_unique(filtered["시장사양"]),
+        placeholder="예: 미국 수출",
+        key="sidebar_market_filter",
+    )
+    filtered = apply_multiselect_filter(filtered, "시장사양", market_selected)
+
 region_selected = st.sidebar.multiselect(
     "판매지역",
     sort_unique(filtered["판매지역"]),
@@ -1130,7 +1465,7 @@ warehouse_selected = st.sidebar.multiselect(
 filtered = apply_multiselect_filter(filtered, "창고", warehouse_selected)
 
 sku_search = st.sidebar.text_input(
-    "SKU / 제품명 검색",
+    "SKU / 제품명 / 제품군 검색",
     placeholder="예: 젤핏 틴트 또는 1AMU",
 ).strip()
 if sku_search:
@@ -1142,6 +1477,12 @@ if sku_search:
             sku_search, case=False, na=False, regex=False
         )
         | filtered["제품명_정리"].str.contains(
+            sku_search, case=False, na=False, regex=False
+        )
+        | filtered["제품군"].str.contains(
+            sku_search, case=False, na=False, regex=False
+        )
+        | filtered["대분류"].str.contains(
             sku_search, case=False, na=False, regex=False
         )
     )
@@ -1169,6 +1510,8 @@ st.caption(
 customer_summary = make_customer_summary(filtered)
 sku_summary = make_sku_summary(filtered)
 monthly_summary = make_monthly_summary(filtered)
+category_summary = make_product_group_summary(filtered, "대분류")
+product_group_summary = make_product_group_summary(filtered, "제품군")
 customer_label_map = customer_summary.set_index("거래처")["거래처표시"].to_dict()
 
 # ---------------------------------------------------------------------
@@ -1179,7 +1522,7 @@ tab_summary, tab_continent, tab_customer, tab_sku, tab_org, tab_quality = st.tab
         "1. 전체 요약",
         "2. 대륙 분석",
         "3. 거래처 분석",
-        "4. SKU 분석",
+        "4. 제품군·SKU 분석",
         "5. 조직·지역·창고",
         "6. 데이터 품질",
     ]
@@ -1439,6 +1782,76 @@ with tab_continent:
         hide_index=True,
     )
 
+    st.divider()
+    st.subheader("대륙별 제품군 비교")
+    group_metric = st.radio(
+        "제품군 비교 기준",
+        ["출고수량", "출고금액"],
+        horizontal=True,
+        key="continent_product_group_metric",
+        format_func=lambda value: (
+            "출고수량 (개)" if value == "출고수량" else "출고금액 (천원)"
+        ),
+    )
+
+    compare_left, compare_right = st.columns(2)
+    with compare_left:
+        selected_continent_group = st.selectbox(
+            "제품군 순위를 볼 대륙",
+            options=continent_summary["대륙"].tolist(),
+            key="continent_product_group_select",
+        )
+        selected_continent_group_df = continent_source[
+            continent_source["대륙"].eq(selected_continent_group)
+        ].copy()
+        continent_group_summary = make_product_group_summary(
+            selected_continent_group_df,
+            "제품군",
+        )
+        st.plotly_chart(
+            top_n_chart(
+                continent_group_summary,
+                "제품군",
+                group_metric,
+                (
+                    f"{selected_continent_group} · Top 제품군 "
+                    + ("출고수량 (개)" if group_metric == "출고수량" else "출고금액 (천원)")
+                ),
+                top_n=min(20, max(1, len(continent_group_summary))),
+            ),
+            width="stretch",
+            key="continent_product_group_ranking_chart",
+        )
+
+    with compare_right:
+        selected_group_compare = st.selectbox(
+            "대륙 실적을 비교할 제품군",
+            options=product_group_summary["제품군"].tolist(),
+            key="product_group_continent_select",
+        )
+        group_continent_source = continent_source[
+            continent_source["제품군"].eq(selected_group_compare)
+        ].copy()
+        group_continent_summary = make_product_group_summary(
+            group_continent_source,
+            "대륙",
+        )
+        st.plotly_chart(
+            top_n_chart(
+                group_continent_summary,
+                "대륙",
+                group_metric,
+                (
+                    f"{selected_group_compare} · 대륙별 "
+                    + ("출고수량 (개)" if group_metric == "출고수량" else "출고금액 (천원)")
+                ),
+                top_n=max(1, len(group_continent_summary)),
+            ),
+            width="stretch",
+            key="product_group_continent_comparison_chart",
+        )
+
+    st.subheader("대륙 → 대분류 → 제품군 → SKU/홋수")
     selected_continent_detail = st.selectbox(
         "상세 분석 대륙",
         options=continent_summary["대륙"].tolist(),
@@ -1448,6 +1861,86 @@ with tab_continent:
         continent_source["대륙"].eq(selected_continent_detail)
     ].copy()
 
+    detail_category_summary = make_product_group_summary(
+        continent_detail_df,
+        "대분류",
+    )
+    selected_detail_category = st.selectbox(
+        "대분류",
+        options=detail_category_summary["대분류"].tolist(),
+        key="continent_detail_category_select",
+    )
+    category_detail_df = continent_detail_df[
+        continent_detail_df["대분류"].eq(selected_detail_category)
+    ].copy()
+    detail_group_summary = make_product_group_summary(category_detail_df, "제품군")
+    selected_detail_group = st.selectbox(
+        "제품군",
+        options=detail_group_summary["제품군"].tolist(),
+        key="continent_detail_product_group_select",
+    )
+    drilldown_df = category_detail_df[
+        category_detail_df["제품군"].eq(selected_detail_group)
+    ].copy()
+    drilldown_sku = make_sku_summary(drilldown_df)
+    drilldown_customer = make_customer_summary(drilldown_df)
+
+    drill_left, drill_right = st.columns(2)
+    with drill_left:
+        st.plotly_chart(
+            top_n_chart(
+                drilldown_sku,
+                "제품명_정리",
+                "출고수량",
+                f"{selected_continent_detail} · {selected_detail_group} SKU/홋수",
+                top_n=min(20, max(1, len(drilldown_sku))),
+            ),
+            width="stretch",
+            key="continent_group_sku_drilldown_chart",
+        )
+    with drill_right:
+        st.plotly_chart(
+            top_n_chart(
+                drilldown_customer,
+                "거래처표시",
+                "출고금액",
+                f"{selected_detail_group} · Top 거래처 출고금액 (천원)",
+                top_n=min(20, max(1, len(drilldown_customer))),
+            ),
+            width="stretch",
+            key="continent_group_customer_drilldown_chart",
+        )
+
+    drilldown_display = drilldown_sku.copy()
+    drilldown_display.insert(0, "순위", range(1, len(drilldown_display) + 1))
+    drilldown_display["출고금액"] = drilldown_display["출고금액"] / 1_000
+    drilldown_display = drilldown_display.rename(
+        columns={
+            "제품명_정리": "제품명",
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
+    )
+    with st.expander("선택 제품군의 SKU/홋수 상세 표", expanded=False):
+        st.dataframe(
+            style_table(
+                drilldown_display[
+                    [
+                        "순위",
+                        "SKU",
+                        "제품명",
+                        "출고수량 (개)",
+                        "출고금액 (천원)",
+                        "거래처수",
+                    ]
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+            height=min(735, 45 + len(drilldown_display) * 32),
+        )
+
+    st.subheader(f"{selected_continent_detail} 전체 Top 거래처·SKU")
     detail_customer = make_customer_summary(continent_detail_df)
     detail_sku = make_sku_summary(continent_detail_df)
 
@@ -1699,6 +2192,83 @@ with tab_customer:
 # SKU 분석
 # ---------------------------------------------------------------------
 with tab_sku:
+    st.subheader("전체 제품군 분석")
+    global_group_metric = st.radio(
+        "제품군 순위 기준",
+        ["출고수량", "출고금액"],
+        horizontal=True,
+        key="global_product_group_metric",
+        format_func=lambda value: (
+            "출고수량 (개)" if value == "출고수량" else "출고금액 (천원)"
+        ),
+    )
+    group_left, group_right = st.columns(2)
+    with group_left:
+        st.plotly_chart(
+            top_n_chart(
+                category_summary,
+                "대분류",
+                global_group_metric,
+                (
+                    "대분류별 "
+                    + ("출고수량 (개)" if global_group_metric == "출고수량" else "출고금액 (천원)")
+                ),
+                top_n=max(1, len(category_summary)),
+            ),
+            width="stretch",
+            key="global_category_ranking_chart",
+        )
+    with group_right:
+        st.plotly_chart(
+            top_n_chart(
+                product_group_summary,
+                "제품군",
+                global_group_metric,
+                (
+                    "Top 20 제품군 · "
+                    + ("출고수량 (개)" if global_group_metric == "출고수량" else "출고금액 (천원)")
+                ),
+                top_n=min(20, max(1, len(product_group_summary))),
+            ),
+            width="stretch",
+            key="global_product_group_ranking_chart",
+        )
+
+    product_group_display = product_group_summary.copy()
+    product_group_display.insert(
+        0,
+        "순위",
+        range(1, len(product_group_display) + 1),
+    )
+    product_group_display["출고금액"] = product_group_display["출고금액"] / 1_000
+    product_group_display = product_group_display.rename(
+        columns={
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
+    )
+    with st.expander("제품군 전체 순위 표", expanded=False):
+        st.dataframe(
+            style_table(
+                product_group_display[
+                    [
+                        "순위",
+                        "제품군",
+                        "출고수량 (개)",
+                        "출고금액 (천원)",
+                        "수량비중",
+                        "금액비중",
+                        "SKU수",
+                        "거래처수",
+                    ]
+                ],
+                percent_cols=["수량비중", "금액비중"],
+            ),
+            width="stretch",
+            hide_index=True,
+            height=650,
+        )
+
     st.subheader("전체 Top SKU · 출고수량 기준")
     st.caption(
         f"총 {len(sku_summary):,}개 SKU를 수량 순위대로 모두 표시합니다. "
@@ -1723,6 +2293,9 @@ with tab_sku:
                     "순위",
                     "SKU",
                     "제품명",
+                    "대분류",
+                    "제품군",
+                    "판매형태",
                     "출고수량 (개)",
                     "출고금액 (천원)",
                 ]
@@ -1849,7 +2422,18 @@ with tab_sku:
 with tab_org:
     org_dimension = st.selectbox(
         "분석 기준",
-        ["대륙", "판매지역", "영업그룹", "영업담당자명", "창고", "제품버전"],
+        [
+            "대륙",
+            "대분류",
+            "제품군",
+            "판매형태",
+            "에디션",
+            "판매지역",
+            "영업그룹",
+            "영업담당자명",
+            "창고",
+            "제품버전",
+        ],
     )
     org_summary = (
         filtered.groupby(org_dimension, as_index=False)
@@ -2015,6 +2599,69 @@ with tab_quality:
     q7.metric("대륙 미지정 행", format_number(unassigned_continent_rows))
     q8.metric("잠재 중복 행", format_number(duplicate_count))
 
+    st.subheader("제품군 매핑 품질")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("원본 고유 SKU", format_number(product_mapping_quality["total_skus"]))
+    m2.metric("제품군 매핑 완료", format_number(product_mapping_quality["matched_skus"]))
+    m3.metric(
+        "미분류 신규 SKU",
+        format_number(product_mapping_quality["unmatched_sku_count"]),
+    )
+    m4.metric(
+        "수동 검토 필요 SKU",
+        format_number(product_mapping_quality["review_sku_count"]),
+    )
+    st.download_button(
+        "현재 제품군 매핑표 다운로드",
+        data=product_mapping_bytes,
+        file_name=product_mapping_name,
+        mime=(
+            "text/csv"
+            if Path(product_mapping_name).suffix.lower() == ".csv"
+            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        key="download_current_product_mapping",
+    )
+
+    if product_mapping_quality["unmatched_sku_count"]:
+        unmatched_product_csv = product_mapping_quality["unmatched_skus"].to_csv(
+            index=False,
+            encoding="utf-8-sig",
+        )
+        st.dataframe(
+            product_mapping_quality["unmatched_skus"],
+            width="stretch",
+            hide_index=True,
+        )
+        st.download_button(
+            "미분류 신규 SKU CSV 다운로드",
+            data=unmatched_product_csv,
+            file_name="SELLIN_미분류_신규_SKU.csv",
+            mime="text/csv",
+            key="download_unmatched_product_skus",
+        )
+
+    review_mapping = product_mapping[
+        product_mapping["검토상태"].eq("검토필요")
+    ][
+        [
+            "품목코드",
+            "품목명",
+            "대분류",
+            "제품군",
+            "판매형태",
+            "기본분석포함",
+            "검토사유",
+        ]
+    ]
+    if not review_mapping.empty:
+        with st.expander("수동 검토 필요 제품군 매핑", expanded=False):
+            st.dataframe(
+                review_mapping,
+                width="stretch",
+                hide_index=True,
+            )
+
     st.subheader("정상 출고와 반품")
     positive_qty = df.loc[df["분석수량"] > 0, "분석수량"].sum()
     return_qty = -df.loc[df["분석수량"] < 0, "분석수량"].sum()
@@ -2040,6 +2687,11 @@ with tab_quality:
             ],
             ["거래처 누락", quality["invalid_customer_count"], "판매처/납품처 코드·명 확인"],
             ["대륙 미지정", unassigned_continent_rows, "거래처별 대륙 매핑 입력"],
+            [
+                "제품군 미분류 SKU",
+                product_mapping_quality["unmatched_sku_count"],
+                "미분류 CSV 확인 후 제품군 매핑표에 품목코드 추가",
+            ],
             ["음수 출고수량", negative_qty_count, "반품·취소 데이터인지 확인"],
             ["0 수량", zero_qty_count, "불필요 행 또는 금액 조정 행인지 확인"],
             [
