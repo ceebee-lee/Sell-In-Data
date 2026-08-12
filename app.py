@@ -640,6 +640,12 @@ def top_n_chart(
         )
     chart_df["_내부텍스트"] = chart_df["_차트값"].map(lambda x: f"{x:,.0f}")
     chart_df["_외부텍스트"] = chart_df["_비중"].map(lambda x: f"{x:.1%}")
+    max_value = chart_df["_차트값"].max() if not chart_df.empty else 0
+    # 비중 라벨을 막대 끝에서 일정 거리만큼 띄웁니다. 각 막대값의 비율을
+    # 곱하는 대신 전체 최댓값 기준의 고정 간격을 사용해야 짧은 막대에서도
+    # 동일한 픽셀 간격처럼 보입니다.
+    label_gap = max_value * 0.012 if max_value > 0 else 0
+    chart_df["_비중위치"] = chart_df["_차트값"] + label_gap
     fig = px.bar(
         chart_df,
         x="_차트값",
@@ -657,6 +663,8 @@ def top_n_chart(
         texttemplate="%{text}",
         textposition="inside",
         insidetextanchor="middle",
+        textangle=0,
+        constraintext="inside",
         textfont_color="white",
         cliponaxis=False,
         hovertemplate=hovertemplate,
@@ -664,7 +672,7 @@ def top_n_chart(
     )
     fig.add_trace(
         go.Scatter(
-            x=chart_df["_차트값"],
+            x=chart_df["_비중위치"],
             y=chart_df["_표시명"],
             text=chart_df["_외부텍스트"],
             mode="text",
@@ -674,7 +682,6 @@ def top_n_chart(
             showlegend=False,
         )
     )
-    max_value = chart_df["_차트값"].max() if not chart_df.empty else 0
     fig.update_layout(
         height=max(500, len(chart_df) * 34 + 120),
         margin=dict(l=20, r=80, t=55, b=20),
@@ -683,10 +690,11 @@ def top_n_chart(
         xaxis_tickformat=",.0f",
         showlegend=False,
         uniformtext_minsize=10,
-        uniformtext_mode="show",
+        # 막대 폭이 숫자를 담기에 부족하면 억지로 회전·축소하지 않고 숨깁니다.
+        uniformtext_mode="hide",
     )
     if max_value > 0:
-        fig.update_xaxes(range=[0, max_value * 1.16])
+        fig.update_xaxes(range=[0, max_value * 1.20])
     fig.update_yaxes(
         categoryorder="array",
         categoryarray=chart_df["_표시명"].tolist(),
