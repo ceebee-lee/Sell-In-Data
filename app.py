@@ -1839,9 +1839,10 @@ with tab_continent:
         detail_group["출고수량"] > 0,
         ["제품군", "출고수량"],
     ].copy()
-    if len(pie_source) > 10:
-        top_groups = pie_source.head(9).copy()
-        other_qty = pie_source.iloc[9:]["출고수량"].sum()
+    product_group_count = len(pie_source)
+    if len(pie_source) > 20:
+        top_groups = pie_source.head(20).copy()
+        other_qty = pie_source.iloc[20:]["출고수량"].sum()
         pie_source = pd.concat(
             [
                 top_groups,
@@ -1849,6 +1850,10 @@ with tab_continent:
             ],
             ignore_index=True,
         )
+    st.caption(
+        f"{selected_continent}의 양수 출고 제품군 {product_group_count:,}개 · "
+        "상위 20개는 개별 표시하고 21위 이하만 '기타 제품군'으로 합산합니다."
+    )
     if pie_source.empty:
         st.info("선택한 조건에는 원형 그래프로 표시할 양수 출고 제품군이 없습니다.")
     else:
@@ -1857,7 +1862,10 @@ with tab_continent:
             names="제품군",
             values="출고수량",
             hole=0.42,
-            title=f"{selected_continent} · 제품군별 출고수량 구성",
+            title=(
+                f"{selected_continent} · 제품군별 출고수량 구성 "
+                "(Top 20 + 21위 이하 기타)"
+            ),
         )
         group_pie.update_traces(
             textposition="inside",
