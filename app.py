@@ -235,8 +235,8 @@ def load_excel(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     )
 
 
-def load_continent_mapping(file_bytes: bytes, file_name: str) -> pd.DataFrame:
-    """CSV/XLSX 형식의 거래처-대륙 매핑 파일을 불러옵니다."""
+def load_region_mapping(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """CSV/XLSX 형식의 거래처-국가-대륙 매핑 파일을 검증해 불러옵니다."""
     suffix = Path(file_name).suffix.lower()
     buffer = io.BytesIO(file_bytes)
 
@@ -247,67 +247,122 @@ def load_continent_mapping(file_bytes: bytes, file_name: str) -> pd.DataFrame:
             buffer.seek(0)
             mapping = pd.read_csv(buffer, encoding="cp949")
     elif suffix in {".xlsx", ".xlsm"}:
-        mapping = pd.read_excel(buffer, engine="openpyxl")
+        workbook = pd.ExcelFile(buffer, engine="openpyxl")
+        target_sheet = (
+            "국가 대륙 매핑"
+            if "국가 대륙 매핑" in workbook.sheet_names
+            else workbook.sheet_names[0]
+        )
+        mapping = pd.read_excel(workbook, sheet_name=target_sheet)
     else:
-        raise ValueError("대륙 매핑 파일은 CSV 또는 XLSX 형식만 지원합니다.")
+        raise ValueError("국가·대륙 매핑 파일은 CSV 또는 XLSX 형식만 지원합니다.")
 
     mapping.columns = [clean_column_name(col) for col in mapping.columns]
-    if "대륙" not in mapping.columns:
-        raise ValueError("매핑 파일에 '대륙' 컬럼이 필요합니다.")
+    missing = [col for col in ["국가", "대륙"] if col not in mapping.columns]
+    if missing:
+        raise ValueError(
+            "매핑 파일에 다음 컬럼이 필요합니다: " + ", ".join(missing)
+        )
 
-    for col in ["거래처", "거래처코드", "거래처명", "대륙"]:
+    mapping_key_columns = ["거래처", "거래처코드", "거래처명"]
+    for col in [*mapping_key_columns, "국가", "대륙"]:
         if col not in mapping.columns:
             mapping[col] = ""
         mapping[col] = mapping[col].astype("string").fillna("").str.strip()
 
+    raw_continent = mapping["대륙"].copy()
     mapping["대륙"] = mapping["대륙"].map(normalize_continent)
-    return mapping[["거래처", "거래처코드", "거래처명", "대륙"]].copy()
+    invalid_continent = (
+        raw_continent.ne("")
+        & mapping["대륙"].eq("기타")
+        & ~raw_continent.eq("기타")
+    )
+    if invalid_continent.any():
+        invalid_values = sorted(raw_continent.loc[invalid_continent].unique().tolist())
+        raise ValueError(
+            "허용되지 않은 대륙 값이 있습니다: " + ", ".join(invalid_values)
+        )
+
+    mapping["국가"] = mapping["국가"].replace("", "미지정")
+    mapping["대륙"] = mapping["대륙"].replace("", "미지정")
+
+    if not mapping[mapping_key_columns].ne("").any(axis=1).all():
+        bad_rows = mapping.index[~mapping[mapping_key_columns].ne("").any(axis=1)] + 2
+        raise ValueError(
+            "거래처·거래처코드·거래처명이 모두 비어 있는 행이 있습니다: "
+            + ", ".join(map(str, bad_rows[:10]))
+        )
+
+    for key in mapping_key_columns:
+        keyed = mapping[mapping[key].ne("")].copy()
+        if keyed.empty:
+            continue
+        conflicts = (
+            keyed.groupby(key)[["국가", "대륙"]]
+            .apply(lambda group: len(group.drop_duplicates()))
+        )
+        conflict_keys = conflicts[conflicts.gt(1)].index.tolist()
+        if conflict_keys:
+            raise ValueError(
+                f"동일 {key}에 서로 다른 국가·대륙이 입력되어 있습니다: "
+                + ", ".join(map(str, conflict_keys[:10]))
+            )
+
+    country_continent_conflicts = (
+        mapping[
+            mapping["국가"].ne("미지정") & mapping["대륙"].ne("미지정")
+        ]
+        .groupby("국가")["대륙"]
+        .nunique()
+    )
+    conflict_countries = country_continent_conflicts[
+        country_continent_conflicts.gt(1)
+    ].index.tolist()
+    if conflict_countries:
+        raise ValueError(
+            "동일 국가에 서로 다른 대륙이 입력되어 있습니다: "
+            + ", ".join(map(str, conflict_countries[:10]))
+        )
+
+    return mapping[
+        ["거래처", "거래처코드", "거래처명", "국가", "대륙"]
+    ].copy()
 
 
-def apply_continent_mapping(
+def apply_region_mapping(
     sellin_df: pd.DataFrame,
     mapping_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """거래처 → 거래처코드 → 거래처명 순으로 대륙을 연결합니다."""
+    """거래처 → 거래처코드 → 거래처명 순으로 국가·대륙을 함께 연결합니다."""
     result = sellin_df.copy()
-    if "대륙" in result.columns:
-        result["대륙"] = result["대륙"].map(normalize_continent)
-    else:
-        result["대륙"] = "미지정"
+    result["국가"] = "미지정"
+    result["대륙"] = "미지정"
 
     mapping = mapping_df.copy()
-    for col in ["거래처", "거래처코드", "거래처명", "대륙"]:
+    for col in ["거래처", "거래처코드", "거래처명", "국가", "대륙"]:
         if col not in mapping.columns:
             mapping[col] = ""
         mapping[col] = mapping[col].astype("string").fillna("").str.strip()
+    mapping["국가"] = mapping["국가"].replace("", "미지정")
     mapping["대륙"] = mapping["대륙"].replace("", "미지정")
 
-    customer_map = (
-        mapping[mapping["거래처"].ne("")]
-        .drop_duplicates("거래처", keep="last")
-        .set_index("거래처")["대륙"]
-    )
-    customer_match = result["거래처"].map(customer_map)
-    result["대륙"] = result["대륙"].mask(customer_match.notna(), customer_match)
+    matched = pd.Series(False, index=result.index)
+    for key in ["거래처", "거래처코드", "거래처명"]:
+        keyed = (
+            mapping[mapping[key].ne("")]
+            .drop_duplicates(key, keep="last")
+            .set_index(key)[["국가", "대륙"]]
+        )
+        if keyed.empty:
+            continue
+        country_match = result[key].map(keyed["국가"])
+        continent_match = result[key].map(keyed["대륙"])
+        hit = ~matched & (country_match.notna() | continent_match.notna())
+        result.loc[hit, "국가"] = country_match.loc[hit].fillna("미지정")
+        result.loc[hit, "대륙"] = continent_match.loc[hit].fillna("미지정")
+        matched = matched | hit
 
-    code_map = (
-        mapping[mapping["거래처코드"].ne("")]
-        .drop_duplicates("거래처코드", keep="last")
-        .set_index("거래처코드")["대륙"]
-    )
-    code_match = result["거래처코드"].map(code_map)
-    unmatched_customer = customer_match.isna()
-    result["대륙"] = result["대륙"].mask(unmatched_customer & code_match.notna(), code_match)
-
-    name_map = (
-        mapping[mapping["거래처명"].ne("")]
-        .drop_duplicates("거래처명", keep="last")
-        .set_index("거래처명")["대륙"]
-    )
-    name_match = result["거래처명"].map(name_map)
-    unmatched_code = unmatched_customer & code_match.isna()
-    result["대륙"] = result["대륙"].mask(unmatched_code & name_match.notna(), name_match)
-
+    result["국가"] = result["국가"].fillna("미지정").replace("", "미지정")
     result["대륙"] = result["대륙"].fillna("미지정").replace("", "미지정")
 
     return result
@@ -471,6 +526,7 @@ def make_product_group_summary(
             출고금액=("분석금액", "sum"),
             SKU수=("SKU", "nunique"),
             거래처수=("거래처", "nunique"),
+            국가수=("국가", "nunique"),
             대륙수=("대륙", "nunique"),
         )
         .sort_values(["출고수량", "출고금액"], ascending=False)
@@ -672,11 +728,14 @@ def apply_multiselect_filter(
 
 def make_customer_summary(df: pd.DataFrame) -> pd.DataFrame:
     source = df.copy()
+    if "국가" not in source.columns:
+        source["국가"] = "미지정"
     if "대륙" not in source.columns:
         source["대륙"] = "미지정"
     result = (
         source.groupby(["거래처", "거래처명", "거래처코드"], dropna=False)
         .agg(
+            국가=("국가", representative_text),
             대륙=("대륙", representative_text),
             출고수량=("분석수량", "sum"),
             출고금액=("분석금액", "sum"),
@@ -688,6 +747,8 @@ def make_customer_summary(df: pd.DataFrame) -> pd.DataFrame:
     )
     result["거래처표시"] = (
         result["대륙"].astype("string").fillna("미지정")
+        + " | "
+        + result["국가"].astype("string").fillna("미지정")
         + " | "
         + result["거래처명"].astype("string").fillna("미기재")
     )
@@ -739,11 +800,13 @@ def make_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
 def make_customer_sku_rank(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
     """거래처별 출고수량 상위 SKU를 동률과 관계없이 정확히 N개까지 반환."""
     source = df.copy()
+    if "국가" not in source.columns:
+        source["국가"] = "미지정"
     if "대륙" not in source.columns:
         source["대륙"] = "미지정"
     result = (
         source.groupby(
-            ["거래처", "거래처명", "거래처코드", "대륙", "SKU"],
+            ["거래처", "거래처명", "거래처코드", "국가", "대륙", "SKU"],
             as_index=False,
         )
         .agg(
@@ -760,6 +823,8 @@ def make_customer_sku_rank(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
     result["거래처내순위"] = result.groupby("거래처").cumcount() + 1
     result["거래처표시"] = (
         result["대륙"].astype("string").fillna("미지정")
+        + " | "
+        + result["국가"].astype("string").fillna("미지정")
         + " | "
         + result["거래처명"].astype("string").fillna("미기재")
     )
@@ -1002,7 +1067,7 @@ def style_table(df: pd.DataFrame, percent_cols: list[str] | None = None):
 # ---------------------------------------------------------------------
 st.title("SELL-IN 분석 대시보드")
 st.caption(
-    "ERP 출고 데이터를 기준으로 전체 실적, 대륙·제품군, 거래처, SKU, 월별 추이 및 데이터 품질을 분석합니다."
+    "ERP 출고 데이터를 기준으로 전체 실적, 대륙·국가·제품군, 거래처, SKU, 월별 추이 및 데이터 품질을 분석합니다."
 )
 
 uploaded_file = st.sidebar.file_uploader(
@@ -1030,8 +1095,8 @@ else:
         - 전체 Top SKU / Top 거래처
         - 거래처별 Top SKU
         - 거래처·월별 출고수량 히트맵 및 실적 집중도
-        - 거래처별 대륙 매핑 및 대륙별 SELL-IN 분석
-        - SKU 제품군 매핑 및 대륙 → 대분류 → 제품군 → SKU/홋수 분석
+        - 거래처별 국가·대륙 매핑 및 지역별 SELL-IN 분석
+        - SKU 제품군 매핑 및 대륙 → 국가 → 대분류 → 제품군 → SKU/홋수 분석
         - 본품·미니·세트·리필 및 에디션 필터
         - 판매지역·영업그룹·담당자·창고 분석
         - 누락값·음수 출고·잠재 중복 등 데이터 품질 점검
@@ -1177,7 +1242,7 @@ if product_mapping_quality["unmatched_sku_count"]:
     )
 
 # ---------------------------------------------------------------------
-# 2. 거래처별 대륙 매핑
+# 2. 거래처별 국가·대륙 매핑
 # ---------------------------------------------------------------------
 customer_master = (
     df[["거래처", "거래처코드", "거래처명"]]
@@ -1186,40 +1251,45 @@ customer_master = (
     .reset_index(drop=True)
 )
 customer_master["대륙"] = "미지정"
+customer_master["국가"] = "미지정"
 
 st.sidebar.divider()
-st.sidebar.subheader("거래처 대륙 매핑")
-continent_mapping_file = st.sidebar.file_uploader(
-    "기존 대륙 매핑 불러오기",
+st.sidebar.subheader("거래처 국가·대륙 매핑")
+region_mapping_file = st.sidebar.file_uploader(
+    "국가·대륙 매핑표 업로드",
     type=["csv", "xlsx", "xlsm"],
-    key="continent_mapping_upload",
-    help="이 대시보드에서 저장한 거래처-대륙 매핑 파일을 재사용할 수 있습니다.",
+    key="region_mapping_upload",
+    help="거래처, 거래처코드, 거래처명, 국가, 대륙 열이 있는 매핑표를 업로드합니다.",
 )
 
 mapping_message = ""
 mapping_file_hash = "no_mapping"
-if continent_mapping_file is not None:
+if region_mapping_file is not None:
     try:
-        mapping_file_bytes = continent_mapping_file.getvalue()
+        mapping_file_bytes = region_mapping_file.getvalue()
         mapping_file_hash = hashlib.sha256(mapping_file_bytes).hexdigest()[:12]
-        uploaded_mapping = load_continent_mapping(
+        uploaded_mapping = load_region_mapping(
             mapping_file_bytes,
-            continent_mapping_file.name,
+            region_mapping_file.name,
         )
-        customer_master = apply_continent_mapping(
+        customer_master = apply_region_mapping(
             customer_master,
             uploaded_mapping,
         )
-        mapping_message = f"{continent_mapping_file.name} 매핑을 불러왔습니다."
+        mapping_message = f"{region_mapping_file.name} 매핑을 불러왔습니다."
     except Exception as exc:
-        st.sidebar.error(f"대륙 매핑 파일 오류: {exc}")
+        st.sidebar.error(f"국가·대륙 매핑 파일 오류: {exc}")
 
 with st.expander(
-    "거래처별 대륙 입력·수정",
-    expanded=bool(customer_master["대륙"].eq("미지정").any()),
+    "거래처별 국가·대륙 입력·수정",
+    expanded=bool(
+        customer_master["국가"].eq("미지정").any()
+        or customer_master["대륙"].eq("미지정").any()
+    ),
 ):
     st.caption(
-        "거래처별 대륙을 직접 선택한 뒤 '대륙 매핑 적용'을 누르세요. "
+        "업로드한 값이 표시됩니다. 필요한 경우 국가와 대륙을 직접 수정한 뒤 "
+        "'국가·대륙 매핑 적용'을 누르세요. "
         "여러 행을 수정해도 적용 버튼을 누를 때 한 번만 다시 계산됩니다."
     )
     if mapping_message:
@@ -1232,16 +1302,22 @@ with st.expander(
         .encode("utf-8")
     ).hexdigest()[:12]
     editor_key = (
-        f"continent_editor_{source_file_hash}_{sheet_name}_"
+        f"region_editor_{source_file_hash}_{sheet_name}_"
         f"{mapping_file_hash}_{customer_identity_hash}"
     )
-    with st.form(key=f"continent_form_{editor_key}", clear_on_submit=False):
-        edited_continent_mapping = st.data_editor(
-            customer_master[["거래처", "거래처코드", "거래처명", "대륙"]],
+    with st.form(key=f"region_form_{editor_key}", clear_on_submit=False):
+        edited_region_mapping = st.data_editor(
+            customer_master[
+                ["거래처", "거래처코드", "거래처명", "국가", "대륙"]
+            ],
             column_config={
                 "거래처": st.column_config.TextColumn("거래처", disabled=True),
                 "거래처코드": st.column_config.TextColumn("거래처코드", disabled=True),
                 "거래처명": st.column_config.TextColumn("거래처명", disabled=True),
+                "국가": st.column_config.TextColumn(
+                    "국가",
+                    help="예: 싱가포르, 말레이시아, 호주",
+                ),
                 "대륙": st.column_config.SelectboxColumn(
                     "대륙",
                     options=CONTINENT_OPTIONS,
@@ -1253,32 +1329,57 @@ with st.expander(
             width="stretch",
             key=editor_key,
         )
-        st.form_submit_button("대륙 매핑 적용", type="primary")
+        st.form_submit_button("국가·대륙 매핑 적용", type="primary")
 
-    mapping_csv = edited_continent_mapping[
-        ["거래처", "거래처코드", "거래처명", "대륙"]
+    mapping_csv = edited_region_mapping[
+        ["거래처", "거래처코드", "거래처명", "국가", "대륙"]
     ].to_csv(
         index=False,
         encoding="utf-8-sig",
     )
     st.download_button(
-        "거래처-대륙 매핑 CSV 저장",
+        "거래처 국가·대륙 매핑 CSV 저장",
         data=mapping_csv,
-        file_name="SELLIN_거래처_대륙_매핑.csv",
+        file_name="SELLIN_거래처_국가_대륙_매핑.csv",
         mime="text/csv",
     )
 
-df = apply_continent_mapping(df, edited_continent_mapping)
+country_continent_conflicts = (
+    edited_region_mapping[
+        edited_region_mapping["국가"].ne("미지정")
+        & edited_region_mapping["국가"].ne("")
+        & edited_region_mapping["대륙"].ne("미지정")
+    ]
+    .groupby("국가")["대륙"]
+    .nunique()
+)
+conflict_countries = country_continent_conflicts[
+    country_continent_conflicts.gt(1)
+].index.tolist()
+if conflict_countries:
+    st.error(
+        "동일 국가에 서로 다른 대륙이 지정되어 있습니다: "
+        + ", ".join(map(str, conflict_countries))
+    )
+    st.stop()
 
+df = apply_region_mapping(df, edited_region_mapping)
+
+unassigned_country_count = int(
+    df.loc[df["국가"].eq("미지정"), "거래처"].nunique()
+)
 unassigned_customer_count = int(
     df.loc[df["대륙"].eq("미지정"), "거래처"].nunique()
 )
-if unassigned_customer_count:
-    unassigned_row_share = df["대륙"].eq("미지정").mean()
+if unassigned_country_count or unassigned_customer_count:
+    unassigned_row_share = (
+        df["국가"].eq("미지정") | df["대륙"].eq("미지정")
+    ).mean()
     st.warning(
-        f"대륙이 미지정된 거래처가 {unassigned_customer_count:,}개 있습니다. "
+        f"국가 미지정 {unassigned_country_count:,}개 · "
+        f"대륙 미지정 {unassigned_customer_count:,}개 거래처가 있습니다. "
         f"전체 행의 {unassigned_row_share:.1%}가 미지정이므로, 발표 전 "
-        "'거래처별 대륙 입력·수정'에서 매핑을 완료하세요."
+        "'거래처별 국가·대륙 입력·수정'에서 매핑을 완료하세요."
     )
 
 # ---------------------------------------------------------------------
@@ -1289,11 +1390,13 @@ st.sidebar.subheader("전체 분석 거래처 기준")
 
 all_customers = sort_unique(df["거래처"])
 sidebar_customer_labels = (
-    df[["거래처", "대륙", "거래처명"]]
+    df[["거래처", "대륙", "국가", "거래처명"]]
     .drop_duplicates("거래처")
     .assign(
         거래처표시=lambda data: (
             data["대륙"].astype("string").fillna("미지정")
+            + " | "
+            + data["국가"].astype("string").fillna("미지정")
             + " | "
             + data["거래처명"].astype("string").fillna("미기재")
         )
@@ -1396,6 +1499,13 @@ continent_selected = st.sidebar.multiselect(
     placeholder="미선택 시 전체",
 )
 filtered = apply_multiselect_filter(filtered, "대륙", continent_selected)
+
+country_selected = st.sidebar.multiselect(
+    "국가",
+    sort_unique(filtered["국가"]),
+    placeholder="미선택 시 전체",
+)
+filtered = apply_multiselect_filter(filtered, "국가", country_selected)
 
 category_selected = st.sidebar.multiselect(
     "대분류",
@@ -1520,7 +1630,7 @@ customer_label_map = customer_summary.set_index("거래처")["거래처표시"].
 tab_summary, tab_continent, tab_customer, tab_sku, tab_org, tab_quality = st.tabs(
     [
         "1. 전체 요약",
-        "2. 대륙 분석",
+        "2. 대륙·국가 분석",
         "3. 거래처 분석",
         "4. 제품군·SKU 분석",
         "5. 조직·지역·창고",
@@ -1648,29 +1758,31 @@ with tab_summary:
     )
 
 # ---------------------------------------------------------------------
-# 대륙 분석
+# 대륙·국가 분석
 # ---------------------------------------------------------------------
 with tab_continent:
-    assigned_rows = filtered[~filtered["대륙"].eq("미지정")]
+    assigned_rows = filtered[
+        ~filtered["대륙"].eq("미지정") & ~filtered["국가"].eq("미지정")
+    ]
     assigned_customer_count = assigned_rows["거래처"].nunique()
     total_customer_count = filtered["거래처"].nunique()
     assigned_row_share = len(assigned_rows) / len(filtered) if len(filtered) else 0
     st.caption(
-        f"대륙 지정 거래처 {assigned_customer_count:,}/{total_customer_count:,}개 · "
+        f"국가·대륙 지정 거래처 {assigned_customer_count:,}/{total_customer_count:,}개 · "
         f"분석 행 커버리지 {assigned_row_share:.1%}"
     )
     include_unassigned_continent = st.checkbox(
-        "대륙 분석에 '미지정' 포함",
+        "대륙·국가 분석에 '미지정' 포함",
         value=False,
-        help="체크하지 않으면 대륙이 확인된 거래처만 차트와 요약에 포함됩니다.",
+        help="체크하지 않으면 국가와 대륙이 모두 확인된 거래처만 포함됩니다.",
     )
     continent_source = (
         filtered.copy() if include_unassigned_continent else assigned_rows.copy()
     )
     if continent_source.empty:
         st.warning(
-            "대륙이 지정된 거래처가 없어 '미지정' 데이터를 표시합니다. "
-            "상단의 거래처별 대륙 입력·수정에서 매핑을 완료하세요."
+            "국가·대륙이 지정된 거래처가 없어 '미지정' 데이터를 표시합니다. "
+            "상단의 거래처별 국가·대륙 입력·수정에서 매핑을 완료하세요."
         )
         continent_source = filtered.copy()
 
@@ -1782,6 +1894,85 @@ with tab_continent:
         hide_index=True,
     )
 
+    country_summary = (
+        continent_source.groupby(["대륙", "국가"], as_index=False)
+        .agg(
+            출고수량=("분석수량", "sum"),
+            출고금액=("분석금액", "sum"),
+            거래처수=("거래처", "nunique"),
+            SKU수=("SKU", "nunique"),
+            출고건수=("출고번호", "nunique"),
+        )
+        .sort_values(["출고수량", "출고금액"], ascending=False)
+        .reset_index(drop=True)
+    )
+    country_total = country_summary["출고수량"].sum()
+    country_summary["비중"] = np.where(
+        country_total != 0,
+        country_summary["출고수량"] / country_total,
+        0,
+    )
+    country_summary["지역표시"] = (
+        country_summary["대륙"].astype("string")
+        + " | "
+        + country_summary["국가"].astype("string")
+    )
+
+    st.subheader("국가별 요약")
+    country_left, country_right = st.columns(2)
+    with country_left:
+        st.plotly_chart(
+            top_n_chart(
+                country_summary,
+                "지역표시",
+                "출고수량",
+                "국가별 출고수량 (개)",
+                top_n=min(30, max(1, len(country_summary))),
+            ),
+            width="stretch",
+            key="country_quantity_chart",
+        )
+    with country_right:
+        country_amount_chart = country_summary.copy()
+        st.plotly_chart(
+            top_n_chart(
+                country_amount_chart,
+                "지역표시",
+                "출고금액",
+                "국가별 출고금액 (천원)",
+                top_n=min(30, max(1, len(country_amount_chart))),
+            ),
+            width="stretch",
+            key="country_amount_chart",
+        )
+
+    country_display = country_summary.copy()
+    country_display["출고금액"] = country_display["출고금액"] / 1_000
+    country_display = country_display.rename(
+        columns={
+            "출고수량": "출고수량 (개)",
+            "출고금액": "출고금액 (천원)",
+        }
+    )
+    st.dataframe(
+        style_table(
+            country_display[
+                [
+                    "대륙",
+                    "국가",
+                    "출고수량 (개)",
+                    "출고금액 (천원)",
+                    "비중",
+                    "거래처수",
+                    "SKU수",
+                ]
+            ],
+            percent_cols=["비중"],
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
     st.divider()
     st.subheader("대륙별 제품군 비교")
     group_metric = st.radio(
@@ -1851,7 +2042,7 @@ with tab_continent:
             key="product_group_continent_comparison_chart",
         )
 
-    st.subheader("대륙 → 대분류 → 제품군 → SKU/홋수")
+    st.subheader("대륙 → 국가 → 대분류 → 제품군 → SKU/홋수")
     selected_continent_detail = st.selectbox(
         "상세 분석 대륙",
         options=continent_summary["대륙"].tolist(),
@@ -1861,8 +2052,25 @@ with tab_continent:
         continent_source["대륙"].eq(selected_continent_detail)
     ].copy()
 
+    detail_country_summary = (
+        continent_detail_df.groupby("국가", as_index=False)
+        .agg(
+            출고수량=("분석수량", "sum"),
+            출고금액=("분석금액", "sum"),
+        )
+        .sort_values(["출고수량", "출고금액"], ascending=False)
+    )
+    selected_country_detail = st.selectbox(
+        "상세 분석 국가",
+        options=detail_country_summary["국가"].tolist(),
+        key="continent_country_detail_select",
+    )
+    country_detail_df = continent_detail_df[
+        continent_detail_df["국가"].eq(selected_country_detail)
+    ].copy()
+
     detail_category_summary = make_product_group_summary(
-        continent_detail_df,
+        country_detail_df,
         "대분류",
     )
     selected_detail_category = st.selectbox(
@@ -1940,9 +2148,11 @@ with tab_continent:
             height=min(735, 45 + len(drilldown_display) * 32),
         )
 
-    st.subheader(f"{selected_continent_detail} 전체 Top 거래처·SKU")
-    detail_customer = make_customer_summary(continent_detail_df)
-    detail_sku = make_sku_summary(continent_detail_df)
+    st.subheader(
+        f"{selected_continent_detail} · {selected_country_detail} Top 거래처·SKU"
+    )
+    detail_customer = make_customer_summary(country_detail_df)
+    detail_sku = make_sku_summary(country_detail_df)
 
     left, right = st.columns(2)
     with left:
@@ -1951,7 +2161,7 @@ with tab_continent:
                 detail_customer,
                 "거래처표시",
                 "출고금액",
-                f"{selected_continent_detail} · Top 거래처 출고금액 (천원)",
+                f"{selected_country_detail} · Top 거래처 출고금액 (천원)",
                 top_n=min(20, max(1, len(detail_customer))),
             ),
             width="stretch",
@@ -1963,7 +2173,7 @@ with tab_continent:
                 detail_sku,
                 "제품명_정리",
                 "출고수량",
-                f"{selected_continent_detail} · Top 20 SKU 출고수량 (개)",
+                f"{selected_country_detail} · Top 20 SKU 출고수량 (개)",
                 top_n=min(20, max(1, len(detail_sku))),
             ),
             width="stretch",
@@ -1978,6 +2188,17 @@ with tab_continent:
         "대륙 요약 CSV 다운로드",
         data=continent_csv,
         file_name="SELLIN_대륙_요약.csv",
+        mime="text/csv",
+    )
+
+    country_csv = country_summary.drop(columns=["지역표시"]).to_csv(
+        index=False,
+        encoding="utf-8-sig",
+    )
+    st.download_button(
+        "국가 요약 CSV 다운로드",
+        data=country_csv,
+        file_name="SELLIN_국가_요약.csv",
         mime="text/csv",
     )
 
@@ -2001,7 +2222,7 @@ with tab_customer:
     customer_main_display["출고금액"] = customer_main_display["출고금액"] / 1_000
     customer_main_display = customer_main_display.rename(
         columns={
-            "거래처표시": "대륙 | 거래처명",
+            "거래처표시": "대륙 | 국가 | 거래처명",
             "출고수량": "출고수량 (개)",
             "출고금액": "출고금액 (천원)",
         }
@@ -2011,7 +2232,7 @@ with tab_customer:
             customer_main_display[
                 [
                     "순위",
-                    "대륙 | 거래처명",
+                    "대륙 | 국가 | 거래처명",
                     "출고수량 (개)",
                     "출고금액 (천원)",
                     "금액비중",
@@ -2046,7 +2267,7 @@ with tab_customer:
         )
         customer_detail_display = customer_detail_display.rename(
             columns={
-                "거래처표시": "대륙 | 거래처명",
+                "거래처표시": "대륙 | 국가 | 거래처명",
                 "출고수량": "출고수량 (개)",
                 "출고금액": "출고금액 (천원)",
                 "건당평균금액": "건당평균금액 (천원)",
@@ -2057,7 +2278,7 @@ with tab_customer:
                 customer_detail_display[
                     [
                         "순위",
-                        "대륙 | 거래처명",
+                        "대륙 | 국가 | 거래처명",
                         "거래처코드",
                         "출고수량 (개)",
                         "출고금액 (천원)",
@@ -2152,6 +2373,8 @@ with tab_customer:
     heatmap_source = filtered[filtered["거래처"].isin(top_customer_keys)].copy()
     heatmap_source["거래처표시"] = (
         heatmap_source["대륙"].astype("string").fillna("미지정")
+        + " | "
+        + heatmap_source["국가"].astype("string").fillna("미지정")
         + " | "
         + heatmap_source["거래처명"].astype("string").fillna("미기재")
     )
@@ -2345,7 +2568,7 @@ with tab_sku:
     customer_sku_display["출고금액"] = customer_sku_display["출고금액"] / 1_000
     customer_sku_display = customer_sku_display.rename(
         columns={
-            "거래처표시": "대륙 | 거래처명",
+            "거래처표시": "대륙 | 국가 | 거래처명",
             "제품명_정리": "제품명",
             "출고수량": "출고수량 (개)",
             "출고금액": "출고금액 (천원)",
@@ -2355,7 +2578,7 @@ with tab_sku:
         style_table(
             customer_sku_display[
                 [
-                    "대륙 | 거래처명",
+                    "대륙 | 국가 | 거래처명",
                     "거래처코드",
                     "거래처내순위",
                     "SKU",
@@ -2424,6 +2647,7 @@ with tab_org:
         "분석 기준",
         [
             "대륙",
+            "국가",
             "대분류",
             "제품군",
             "판매형태",
@@ -2513,7 +2737,10 @@ with tab_org:
 
     st.subheader("담당자 × 거래처")
     owner_customer = (
-        filtered.groupby(["영업담당자명", "대륙", "거래처명"], as_index=False)
+        filtered.groupby(
+            ["영업담당자명", "대륙", "국가", "거래처명"],
+            as_index=False,
+        )
         .agg(
             출고수량=("분석수량", "sum"),
             출고금액=("분석금액", "sum"),
@@ -2521,8 +2748,10 @@ with tab_org:
         )
         .sort_values("출고수량", ascending=False)
     )
-    owner_customer["대륙 | 거래처명"] = (
+    owner_customer["대륙 | 국가 | 거래처명"] = (
         owner_customer["대륙"].astype("string").fillna("미지정")
+        + " | "
+        + owner_customer["국가"].astype("string").fillna("미지정")
         + " | "
         + owner_customer["거래처명"].astype("string").fillna("미기재")
     )
@@ -2538,7 +2767,7 @@ with tab_org:
             owner_customer.head(100)[
                 [
                     "영업담당자명",
-                    "대륙 | 거래처명",
+                    "대륙 | 국가 | 거래처명",
                     "출고수량 (개)",
                     "출고금액 (천원)",
                     "SKU수",
@@ -2568,6 +2797,7 @@ with tab_quality:
         ((df["분석수량"] > 0) & (df["분석금액"] == 0)).sum()
     )
 
+    unassigned_country_rows = int(df["국가"].eq("미지정").sum())
     unassigned_continent_rows = int(df["대륙"].eq("미지정").sum())
     numeric_failure_count = int(quality.get("numeric_failure_count", 0))
 
@@ -2593,11 +2823,12 @@ with tab_quality:
     q3.metric("출고일 오류/누락", format_number(quality["invalid_date_count"]))
     q4.metric("숫자 변환 실패", format_number(numeric_failure_count))
 
-    q5, q6, q7, q8 = st.columns(4)
+    q5, q6, q7, q8, q9 = st.columns(5)
     q5.metric("SKU 누락", format_number(quality["invalid_sku_count"]))
     q6.metric("거래처 누락", format_number(quality["invalid_customer_count"]))
-    q7.metric("대륙 미지정 행", format_number(unassigned_continent_rows))
-    q8.metric("잠재 중복 행", format_number(duplicate_count))
+    q7.metric("국가 미지정 행", format_number(unassigned_country_rows))
+    q8.metric("대륙 미지정 행", format_number(unassigned_continent_rows))
+    q9.metric("잠재 중복 행", format_number(duplicate_count))
 
     st.subheader("제품군 매핑 품질")
     m1, m2, m3, m4 = st.columns(4)
@@ -2686,7 +2917,8 @@ with tab_quality:
                 "순위는 SKU로 통합되며 제품명 이력만 확인",
             ],
             ["거래처 누락", quality["invalid_customer_count"], "판매처/납품처 코드·명 확인"],
-            ["대륙 미지정", unassigned_continent_rows, "거래처별 대륙 매핑 입력"],
+            ["국가 미지정", unassigned_country_rows, "거래처별 국가·대륙 매핑 입력"],
+            ["대륙 미지정", unassigned_continent_rows, "거래처별 국가·대륙 매핑 입력"],
             [
                 "제품군 미분류 SKU",
                 product_mapping_quality["unmatched_sku_count"],
