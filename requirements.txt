@@ -1,5 +1,6 @@
-streamlit==1.60.0
-pandas==2.3.3
-numpy==2.3.5
-openpyxl==3.1.5
-plotly==6.9.0
+streamlit>=1.55,<2
+pandas>=2.2,<3
+numpy>=2.0,<3
+plotly>=6.0,<7
+openpyxl>=3.1,<4
+
