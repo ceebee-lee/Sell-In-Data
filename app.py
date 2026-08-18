@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import io
 import hashlib
 import re
@@ -116,6 +117,53 @@ st.markdown(
     [aria-selected="true"][data-baseweb="tab"] {
         color: #1D4ED8;
         font-weight: 700;
+    }
+    .product-group-list {
+        background: #F8FAFC;
+        border: 1px solid #D7DEE8;
+        border-radius: 12px;
+        padding: 12px 14px;
+    }
+    .product-group-list-title {
+        color: #0F172A;
+        font-size: 0.92rem;
+        font-weight: 700;
+        margin-bottom: 6px;
+    }
+    .product-group-row {
+        display: grid;
+        grid-template-columns: 14px minmax(0, 1fr) auto;
+        align-items: center;
+        column-gap: 10px;
+        min-height: 42px;
+        border-top: 1px solid #E2E8F0;
+    }
+    .product-group-row:first-of-type { border-top: 0; }
+    .product-group-swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        border: 1px solid rgba(15, 23, 42, 0.16);
+    }
+    .product-group-name {
+        color: #1E293B;
+        font-size: 0.92rem;
+        font-weight: 600;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+    }
+    .product-group-value {
+        color: #0F172A;
+        font-size: 0.91rem;
+        font-weight: 700;
+        text-align: right;
+        white-space: nowrap;
+    }
+    .product-group-share {
+        color: #64748B;
+        font-size: 0.78rem;
+        font-weight: 600;
+        margin-left: 7px;
     }
     </style>
     """,
@@ -1942,99 +1990,148 @@ with tab_continent:
         ["제품군", "출고수량"],
     ].copy()
     product_group_count = len(pie_source)
-    if len(pie_source) > 20:
-        top_groups = pie_source.head(20).copy()
-        other_qty = pie_source.iloc[20:]["출고수량"].sum()
-        pie_source = pd.concat(
-            [
-                top_groups,
-                pd.DataFrame({"제품군": ["기타 제품군"], "출고수량": [other_qty]}),
-            ],
-            ignore_index=True,
-        )
+    st.markdown(f"#### {selected_continent} · 제품군별 출고수량 구성")
     st.caption(
-        f"{selected_continent}의 양수 출고 제품군 {product_group_count:,}개 · "
-        "상위 20개는 개별 표시하고 21위 이하만 '기타 제품군'으로 합산합니다."
+        f"양수 출고 제품군 {product_group_count:,}개 · "
+        "도넛은 상위 8개와 9위 이하 기타로 단순화하고, "
+        "전체 Top 20은 아래 표에서 확인할 수 있습니다."
     )
     if pie_source.empty:
         st.info("선택한 조건에는 원형 그래프로 표시할 양수 출고 제품군이 없습니다.")
     else:
-        pie_source["비중"] = (
-            pie_source["출고수량"] / pie_source["출고수량"].sum()
+        total_group_qty = pie_source["출고수량"].sum()
+        top20_source = pie_source.head(20).copy()
+        top20_source.insert(0, "순위", range(1, len(top20_source) + 1))
+        top20_source["비중"] = top20_source["출고수량"] / total_group_qty
+
+        donut_source = pie_source.head(8).copy()
+        donut_source["포함제품군수"] = 1
+        donut_source["색상"] = PRODUCT_GROUP_COLORS[: len(donut_source)]
+        if len(pie_source) > 8:
+            other_qty = pie_source.iloc[8:]["출고수량"].sum()
+            donut_source = pd.concat(
+                [
+                    donut_source,
+                    pd.DataFrame(
+                        {
+                            "제품군": ["기타 제품군"],
+                            "출고수량": [other_qty],
+                            "포함제품군수": [len(pie_source) - 8],
+                            "색상": ["#CBD5E1"],
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
+        donut_source["비중"] = donut_source["출고수량"] / total_group_qty
+        donut_source["표시제품군"] = donut_source["제품군"]
+        other_mask = donut_source["제품군"].eq("기타 제품군")
+        donut_source.loc[other_mask, "표시제품군"] = donut_source.loc[
+            other_mask, "포함제품군수"
+        ].map(lambda count: f"기타 제품군 (9위 이하 {int(count)}개)")
+
+        legend_rows = []
+        for rank, row in donut_source.reset_index(drop=True).iterrows():
+            legend_rows.append(
+                '<div class="product-group-row">'
+                f'<span class="product-group-swatch" '
+                f'style="background:{row["색상"]}"></span>'
+                f'<span class="product-group-name">{rank + 1}. '
+                f'{html.escape(str(row["표시제품군"]))}</span>'
+                f'<span class="product-group-value">{row["출고수량"]:,.0f}개'
+                f'<span class="product-group-share">{row["비중"]:.1%}</span></span>'
+                "</div>"
+            )
+        legend_html = (
+            '<div class="product-group-list">'
+            '<div class="product-group-list-title">제품군 · 출고수량 · 비중</div>'
+            + "".join(legend_rows)
+            + "</div>"
         )
-        pie_source["범례"] = pie_source.apply(
-            lambda row: (
-                f"{row['제품군']}  ·  {row['출고수량']:,.0f}개  ·  "
-                f"{row['비중']:.1%}"
-            ),
-            axis=1,
+
+        legend_col, donut_col = st.columns(
+            [0.94, 1.06],
+            gap="small",
+            vertical_alignment="center",
         )
-        group_pie = px.pie(
-            pie_source,
-            names="범례",
-            values="출고수량",
-            custom_data=["제품군"],
-            hole=0.52,
-            title=(
-                f"{selected_continent} · 제품군별 출고수량 구성 "
-                "(Top 20 + 21위 이하 기타)"
-            ),
-        )
-        group_pie.update_traces(
-            textposition="inside",
-            textinfo="percent",
-            textfont=dict(color="#0F172A", size=12),
-            insidetextorientation="horizontal",
-            sort=False,
-            direction="clockwise",
-            domain=dict(x=[0.55, 1.0], y=[0.02, 0.98]),
-            marker=dict(
-                colors=PRODUCT_GROUP_COLORS[: len(pie_source)],
-                line=dict(color="#FFFFFF", width=2),
-            ),
-            hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "출고수량: %{value:,.0f}개<br>비중: %{percent}<extra></extra>"
-            ),
-        )
-        group_pie.update_layout(
-            height=max(660, len(pie_source) * 27 + 130),
-            margin=dict(l=18, r=20, t=72, b=24),
-            title=dict(x=0.55, xanchor="left"),
-            legend=dict(
-                title=dict(text="제품군 · 출고수량 · 비중"),
-                orientation="v",
-                x=0.0,
-                xanchor="left",
-                y=0.98,
-                yanchor="top",
-                bgcolor="#F8FAFC",
-                bordercolor="#D7DEE8",
-                borderwidth=1,
-                font=dict(color="#1F2937", size=11),
-                itemsizing="constant",
-                traceorder="normal",
-            ),
-            uniformtext_minsize=10,
-            uniformtext_mode="hide",
-            annotations=[
-                dict(
-                    text=f"총<br><b>{pie_source['출고수량'].sum():,.0f}개</b>",
-                    x=0.775,
-                    y=0.50,
-                    xref="paper",
-                    yref="paper",
-                    showarrow=False,
-                    align="center",
-                    font=dict(color="#0F172A", size=15),
-                )
-            ],
-        )
-        st.plotly_chart(
-            group_pie,
-            width="stretch",
-            key="region_continent_product_group_pie_v10",
-        )
+        with legend_col:
+            st.markdown(legend_html, unsafe_allow_html=True)
+        with donut_col:
+            group_pie = px.pie(
+                donut_source,
+                names="표시제품군",
+                values="출고수량",
+                custom_data=["제품군", "포함제품군수"],
+                hole=0.56,
+            )
+            group_pie.update_traces(
+                textposition="inside",
+                textinfo="percent",
+                textfont=dict(color="#0F172A", size=13),
+                insidetextorientation="horizontal",
+                sort=False,
+                direction="clockwise",
+                domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
+                marker=dict(
+                    colors=donut_source["색상"].tolist(),
+                    line=dict(color="#FFFFFF", width=3),
+                ),
+                hovertemplate=(
+                    "<b>%{label}</b><br>"
+                    "출고수량: %{value:,.0f}개<br>비중: %{percent}<extra></extra>"
+                ),
+            )
+            group_pie.update_layout(
+                height=500,
+                margin=dict(l=6, r=6, t=18, b=18),
+                showlegend=False,
+                uniformtext_minsize=11,
+                uniformtext_mode="hide",
+                annotations=[
+                    dict(
+                        text=(
+                            "총 출고수량<br>"
+                            f"<b>{total_group_qty:,.0f}개</b>"
+                        ),
+                        x=0.5,
+                        y=0.5,
+                        xref="paper",
+                        yref="paper",
+                        xanchor="center",
+                        yanchor="middle",
+                        showarrow=False,
+                        align="center",
+                        font=dict(color="#0F172A", size=16),
+                    )
+                ],
+            )
+            st.plotly_chart(
+                group_pie,
+                width="stretch",
+                key="region_continent_product_group_pie_v13",
+            )
+
+        with st.expander("전체 제품군 Top 20 보기", expanded=False):
+            st.dataframe(
+                top20_source.style.format(
+                    {
+                        "출고수량": "{:,.0f}",
+                        "비중": "{:.1%}",
+                    }
+                ),
+                hide_index=True,
+                width="stretch",
+                height=min(738, 38 + len(top20_source) * 35),
+                column_config={
+                    "순위": st.column_config.NumberColumn("순위", width="small"),
+                    "제품군": st.column_config.TextColumn("제품군", width="large"),
+                    "출고수량": st.column_config.NumberColumn(
+                        "출고수량 (개)",
+                        width="medium",
+                    ),
+                    "비중": st.column_config.NumberColumn("비중", width="small"),
+                },
+            )
 
     region_download = (
         country_summary[["대륙", "국가", "출고수량"]]
