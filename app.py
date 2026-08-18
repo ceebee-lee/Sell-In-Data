@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 import streamlit as st
 
 
@@ -18,6 +19,107 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+
+# ---------------------------------------------------------------------
+# 라이트 모드 · 차트 접근성
+# ---------------------------------------------------------------------
+LIGHT_CHART_COLORS = [
+    "#2563EB", "#059669", "#D97706", "#DC2626", "#7C3AED",
+    "#0891B2", "#65A30D", "#DB2777", "#4F46E5", "#0F766E",
+]
+
+PRODUCT_GROUP_COLORS = [
+    "#93C5FD", "#A7F3D0", "#FDE68A", "#FDBA74", "#C4B5FD",
+    "#F9A8D4", "#67E8F9", "#BEF264", "#FCA5A5", "#D8B4FE",
+    "#86EFAC", "#FCD34D", "#7DD3FC", "#F0ABFC", "#A5B4FC",
+    "#6EE7B7", "#FED7AA", "#FDA4AF", "#BAE6FD", "#D9F99D",
+    "#CBD5E1",
+]
+
+pio.templates["sellin_light"] = go.layout.Template(
+    layout=dict(
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        colorway=LIGHT_CHART_COLORS,
+        font=dict(
+            family="Arial, 'Noto Sans KR', sans-serif",
+            color="#172033",
+            size=13,
+        ),
+        title=dict(font=dict(color="#0F172A", size=17)),
+        legend=dict(
+            font=dict(color="#1F2937", size=12),
+            title=dict(font=dict(color="#111827", size=12)),
+        ),
+        xaxis=dict(
+            gridcolor="#E5E7EB",
+            linecolor="#CBD5E1",
+            zerolinecolor="#94A3B8",
+            tickfont=dict(color="#334155"),
+            title=dict(font=dict(color="#334155")),
+        ),
+        yaxis=dict(
+            gridcolor="#E5E7EB",
+            linecolor="#CBD5E1",
+            zerolinecolor="#94A3B8",
+            tickfont=dict(color="#334155"),
+            title=dict(font=dict(color="#334155")),
+        ),
+        hoverlabel=dict(
+            bgcolor="#FFFFFF",
+            bordercolor="#94A3B8",
+            font=dict(color="#111827", size=13),
+        ),
+    )
+)
+pio.templates.default = "sellin_light"
+px.defaults.template = "sellin_light"
+px.defaults.color_discrete_sequence = LIGHT_CHART_COLORS
+
+st.markdown(
+    """
+    <style>
+    :root { color-scheme: light; }
+    [data-testid="stAppViewContainer"] {
+        background: #FFFFFF;
+        color: #111827;
+    }
+    [data-testid="stHeader"] { background: rgba(255, 255, 255, 0.96); }
+    [data-testid="stSidebar"] {
+        background: #F4F7FB;
+        border-right: 1px solid #DCE3EC;
+    }
+    h1, h2, h3, h4, h5, h6 { color: #0F172A !important; }
+    [data-testid="stCaptionContainer"], .stCaption { color: #475569 !important; }
+    [data-testid="stMetric"] {
+        background: #F8FAFC;
+        border: 1px solid #DCE3EC;
+        border-radius: 12px;
+        padding: 14px 16px;
+    }
+    [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {
+        color: #111827;
+    }
+    [data-testid="stExpander"] {
+        background: #FFFFFF;
+        border-color: #D6DEE8;
+        border-radius: 10px;
+    }
+    [data-testid="stFileUploaderDropzone"] {
+        background: #F8FAFC;
+        border-color: #B8C4D3;
+    }
+    [data-baseweb="tab-list"] { border-bottom: 1px solid #D7DEE8; }
+    [data-baseweb="tab"] { color: #334155; }
+    [aria-selected="true"][data-baseweb="tab"] {
+        color: #1D4ED8;
+        font-weight: 700;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -1857,11 +1959,22 @@ with tab_continent:
     if pie_source.empty:
         st.info("선택한 조건에는 원형 그래프로 표시할 양수 출고 제품군이 없습니다.")
     else:
+        pie_source["비중"] = (
+            pie_source["출고수량"] / pie_source["출고수량"].sum()
+        )
+        pie_source["범례"] = pie_source.apply(
+            lambda row: (
+                f"{row['제품군']}  ·  {row['출고수량']:,.0f}개  ·  "
+                f"{row['비중']:.1%}"
+            ),
+            axis=1,
+        )
         group_pie = px.pie(
             pie_source,
-            names="제품군",
+            names="범례",
             values="출고수량",
-            hole=0.42,
+            custom_data=["제품군"],
+            hole=0.52,
             title=(
                 f"{selected_continent} · 제품군별 출고수량 구성 "
                 "(Top 20 + 21위 이하 기타)"
@@ -1869,13 +1982,53 @@ with tab_continent:
         )
         group_pie.update_traces(
             textposition="inside",
-            textinfo="label+percent",
-            hovertemplate="%{label}<br>출고수량: %{value:,.0f}개<extra></extra>",
+            textinfo="percent",
+            textfont=dict(color="#0F172A", size=12),
+            insidetextorientation="horizontal",
+            sort=False,
+            direction="clockwise",
+            domain=dict(x=[0.55, 1.0], y=[0.02, 0.98]),
+            marker=dict(
+                colors=PRODUCT_GROUP_COLORS[: len(pie_source)],
+                line=dict(color="#FFFFFF", width=2),
+            ),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "출고수량: %{value:,.0f}개<br>비중: %{percent}<extra></extra>"
+            ),
         )
         group_pie.update_layout(
-            height=560,
-            margin=dict(l=20, r=20, t=55, b=20),
-            legend_title_text="제품군",
+            height=max(660, len(pie_source) * 27 + 130),
+            margin=dict(l=18, r=20, t=72, b=24),
+            title=dict(x=0.55, xanchor="left"),
+            legend=dict(
+                title=dict(text="제품군 · 출고수량 · 비중"),
+                orientation="v",
+                x=0.0,
+                xanchor="left",
+                y=0.98,
+                yanchor="top",
+                bgcolor="#F8FAFC",
+                bordercolor="#D7DEE8",
+                borderwidth=1,
+                font=dict(color="#1F2937", size=11),
+                itemsizing="constant",
+                traceorder="normal",
+            ),
+            uniformtext_minsize=10,
+            uniformtext_mode="hide",
+            annotations=[
+                dict(
+                    text=f"총<br><b>{pie_source['출고수량'].sum():,.0f}개</b>",
+                    x=0.775,
+                    y=0.50,
+                    xref="paper",
+                    yref="paper",
+                    showarrow=False,
+                    align="center",
+                    font=dict(color="#0F172A", size=15),
+                )
+            ],
         )
         st.plotly_chart(
             group_pie,
