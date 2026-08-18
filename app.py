@@ -887,6 +887,36 @@ def make_customer_summary(df: pd.DataFrame) -> pd.DataFrame:
     return result.sort_values(["출고수량", "거래처"], ascending=[False, True])
 
 
+def group_other_continent_customers_for_chart(
+    customer_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """대륙이 '기타'인 거래처를 차트에서 하나의 '기타' 막대로 합칩니다."""
+    chart_summary = customer_summary.copy()
+    if "대륙" not in chart_summary.columns:
+        return chart_summary
+
+    continent = (
+        chart_summary["대륙"]
+        .astype("string")
+        .fillna("")
+        .str.strip()
+    )
+    other_mask = continent.eq("기타")
+    if not other_mask.any():
+        return chart_summary
+
+    other_quantity = chart_summary.loc[other_mask, "출고수량"].sum()
+    chart_summary = chart_summary.loc[~other_mask].copy()
+    other_row = pd.DataFrame(
+        [{
+            "거래처표시": "기타",
+            "출고수량": other_quantity,
+            "대륙": "기타",
+        }]
+    )
+    return pd.concat([chart_summary, other_row], ignore_index=True, sort=False)
+
+
 def make_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
     # 순위는 SKU만을 고유 키로 집계합니다. 제품명 변경 이력은 품질 탭에서 별도 확인합니다.
     result = (
@@ -2185,9 +2215,16 @@ with tab_customer:
         height=min(735, 45 + top_customer_count * 32),
     )
 
+    customer_chart_summary = group_other_continent_customers_for_chart(
+        customer_summary
+    )
+    st.caption(
+        "대륙이 '기타'인 거래처는 개별 거래처명을 표시하지 않고 "
+        "출고수량을 합산한 하나의 '기타' 막대로 표시합니다."
+    )
     st.plotly_chart(
         top_n_chart(
-            customer_summary,
+            customer_chart_summary,
             "거래처표시",
             "출고수량",
             f"Top {top_customer_count} 거래처 · 출고수량 (개)",
