@@ -966,7 +966,6 @@ def build_customer_sku_excel(
 ) -> bytes:
     """현재 필터 기준의 선택 거래처 SKU 분석표를 서식 있는 XLSX로 만듭니다."""
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.worksheet.table import Table, TableStyleInfo
 
     export = customer_sku_summary.sort_values(
         ["출고수량", "SKU"],
@@ -1048,28 +1047,22 @@ def build_customer_sku_excel(
             cell.border = Border(bottom=thin_gray)
         worksheet.row_dimensions[6].height = 24
 
+        band_fill = PatternFill("solid", fgColor="EFF6FF")
         for row in range(7, 7 + len(export)):
             worksheet.cell(row=row, column=1).alignment = Alignment(horizontal="center")
             worksheet.cell(row=row, column=7).number_format = "#,##0"
             worksheet.cell(row=row, column=8).number_format = "0.0%"
             for column in range(1, 9):
-                worksheet.cell(row=row, column=column).border = Border(bottom=thin_gray)
-                worksheet.cell(row=row, column=column).alignment = Alignment(
+                cell = worksheet.cell(row=row, column=column)
+                cell.border = Border(bottom=thin_gray)
+                cell.alignment = Alignment(
                     vertical="center",
                     horizontal=("right" if column in {7, 8} else None),
                 )
+                if (row - 7) % 2 == 0:
+                    cell.fill = band_fill
 
         last_row = 6 + len(export)
-        if len(export):
-            table = Table(displayName="CustomerSKUAnalysis", ref=f"A6:H{last_row}")
-            table.tableStyleInfo = TableStyleInfo(
-                name="TableStyleMedium2",
-                showFirstColumn=False,
-                showLastColumn=False,
-                showRowStripes=True,
-                showColumnStripes=False,
-            )
-            worksheet.add_table(table)
         worksheet.auto_filter.ref = f"A6:H{last_row}"
 
         column_widths = {
