@@ -927,7 +927,7 @@ def make_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
             거래처수=("거래처", "nunique"),
             출고건수=("출고번호", "nunique"),
             최근출고일=("출고일", "max"),
-            제품명=("제품명", representative_text),
+            제품명_원본=("제품명", representative_text),
             제품명_정리=("제품명_정리", representative_text),
             제품버전=("제품버전", representative_text),
             제품군_분석=("제품군_분석", representative_text),
@@ -977,6 +977,7 @@ def build_customer_sku_excel(
     export = export.rename(
         columns={
             "SKU": "SKU 코드",
+            "제품명_원본": "제품명",
             "출고수량": "출고수량 (개)",
             "수량비중": "수량 비중",
         }
