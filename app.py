@@ -927,6 +927,7 @@ def make_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
             거래처수=("거래처", "nunique"),
             출고건수=("출고번호", "nunique"),
             최근출고일=("출고일", "max"),
+            제품명=("제품명", representative_text),
             제품명_정리=("제품명_정리", representative_text),
             제품버전=("제품버전", representative_text),
             제품군_분석=("제품군_분석", representative_text),
@@ -948,6 +949,147 @@ def make_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
         np.nan,
     )
     return result.sort_values(["출고수량", "출고금액"], ascending=False)
+
+
+def safe_download_filename_part(value: object) -> str:
+    """거래처명을 운영체제와 관계없이 안전한 다운로드 파일명으로 바꿉니다."""
+    text = re.sub(r'[\\/:*?"<>|]+', "_", str(value)).strip(" ._")
+    return text[:60] or "거래처"
+
+
+@st.cache_data(show_spinner=False)
+def build_customer_sku_excel(
+    customer_sku_summary: pd.DataFrame,
+    customer_label: str,
+    start_date_text: str,
+    end_date_text: str,
+) -> bytes:
+    """현재 필터 기준의 선택 거래처 SKU 분석표를 서식 있는 XLSX로 만듭니다."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    export = customer_sku_summary.sort_values(
+        ["출고수량", "SKU"],
+        ascending=[False, True],
+        kind="stable",
+    ).reset_index(drop=True)
+    export.insert(0, "순위", range(1, len(export) + 1))
+    export = export.rename(
+        columns={
+            "SKU": "SKU 코드",
+            "출고수량": "출고수량 (개)",
+            "수량비중": "수량 비중",
+        }
+    )[
+        [
+            "순위",
+            "SKU 코드",
+            "제품명",
+            "대분류",
+            "제품군",
+            "판매형태",
+            "출고수량 (개)",
+            "수량 비중",
+        ]
+    ]
+
+    total_quantity = float(export["출고수량 (개)"].sum())
+    workbook_buffer = io.BytesIO()
+    with pd.ExcelWriter(workbook_buffer, engine="openpyxl") as writer:
+        export.to_excel(
+            writer,
+            sheet_name="SKU 분석",
+            index=False,
+            startrow=5,
+        )
+        worksheet = writer.sheets["SKU 분석"]
+        worksheet.sheet_view.showGridLines = False
+        worksheet.freeze_panes = "A7"
+
+        worksheet.merge_cells("A1:H1")
+        worksheet["A1"] = "SELL-IN 거래처 SKU 분석"
+        worksheet["A1"].font = Font(bold=True, color="FFFFFF", size=16)
+        worksheet["A1"].fill = PatternFill("solid", fgColor="1D4ED8")
+        worksheet["A1"].alignment = Alignment(horizontal="left", vertical="center")
+        worksheet.row_dimensions[1].height = 30
+
+        worksheet["A2"] = "거래처"
+        worksheet.merge_cells("B2:H2")
+        worksheet["B2"] = customer_label
+        worksheet["A3"] = "분석 기간"
+        worksheet.merge_cells("B3:C3")
+        worksheet["B3"] = f"{start_date_text} ~ {end_date_text}"
+        worksheet["D3"] = "총 출고수량 (개)"
+        worksheet["E3"] = total_quantity
+        worksheet["F3"] = "거래 SKU"
+        worksheet["G3"] = len(export)
+        worksheet["A4"] = "다운로드 기준"
+        worksheet.merge_cells("B4:H4")
+        worksheet["B4"] = "화면에 적용된 기간·대륙·국가·제품·조직·검색 필터 기준"
+
+        label_fill = PatternFill("solid", fgColor="E2E8F0")
+        value_fill = PatternFill("solid", fgColor="F8FAFC")
+        for coordinate in ["A2", "B2", "A3", "B3", "D3", "E3", "F3", "G3", "A4", "B4"]:
+            worksheet[coordinate].alignment = Alignment(vertical="center")
+            worksheet[coordinate].fill = value_fill
+        for coordinate in ["A2", "A3", "D3", "F3", "A4"]:
+            worksheet[coordinate].font = Font(bold=True, color="0F172A")
+            worksheet[coordinate].fill = label_fill
+        worksheet["E3"].number_format = "#,##0"
+        worksheet["G3"].number_format = "#,##0"
+
+        header_fill = PatternFill("solid", fgColor="DBEAFE")
+        thin_gray = Side(style="thin", color="CBD5E1")
+        for cell in worksheet[6]:
+            cell.font = Font(bold=True, color="0F172A")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(bottom=thin_gray)
+        worksheet.row_dimensions[6].height = 24
+
+        for row in range(7, 7 + len(export)):
+            worksheet.cell(row=row, column=1).alignment = Alignment(horizontal="center")
+            worksheet.cell(row=row, column=7).number_format = "#,##0"
+            worksheet.cell(row=row, column=8).number_format = "0.0%"
+            for column in range(1, 9):
+                worksheet.cell(row=row, column=column).border = Border(bottom=thin_gray)
+                worksheet.cell(row=row, column=column).alignment = Alignment(
+                    vertical="center",
+                    horizontal=("right" if column in {7, 8} else None),
+                )
+
+        last_row = 6 + len(export)
+        if len(export):
+            table = Table(displayName="CustomerSKUAnalysis", ref=f"A6:H{last_row}")
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2",
+                showFirstColumn=False,
+                showLastColumn=False,
+                showRowStripes=True,
+                showColumnStripes=False,
+            )
+            worksheet.add_table(table)
+        worksheet.auto_filter.ref = f"A6:H{last_row}"
+
+        column_widths = {
+            "A": 8,
+            "B": 18,
+            "C": 42,
+            "D": 16,
+            "E": 24,
+            "F": 14,
+            "G": 18,
+            "H": 14,
+        }
+        for column, width in column_widths.items():
+            worksheet.column_dimensions[column].width = width
+        worksheet.print_title_rows = "1:6"
+        worksheet.sheet_properties.pageSetUpPr.fitToPage = True
+        worksheet.page_setup.fitToWidth = 1
+        worksheet.page_setup.fitToHeight = 0
+        worksheet.sheet_properties.outlinePr.summaryBelow = True
+
+    return workbook_buffer.getvalue()
 
 
 def make_customer_sku_rank(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
@@ -2324,6 +2466,31 @@ with tab_customer:
             width="stretch",
             key="customer_detail_top20_sku_chart",
         )
+
+    customer_sku_excel = build_customer_sku_excel(
+        customer_sku,
+        selected_customer_label,
+        str(start_date),
+        str(end_date),
+    )
+    customer_filename = safe_download_filename_part(
+        selected_customer_summary["거래처명"]
+    )
+    customer_download_key = hashlib.sha256(
+        str(selected_customer).encode("utf-8")
+    ).hexdigest()[:12]
+    st.download_button(
+        "선택 거래처 SKU 분석 엑셀 다운로드",
+        data=customer_sku_excel,
+        file_name=f"SELLIN_{customer_filename}_SKU_분석.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        key=f"customer_sku_excel_{customer_download_key}",
+    )
+    st.caption(
+        "선택한 거래처의 SKU 순위·코드·제품명·제품군·판매형태·출고수량·"
+        "수량 비중을 현재 화면 필터 기준으로 저장합니다."
+    )
 
     st.subheader("거래처 × 월 히트맵")
     heatmap_top_n = st.slider(
